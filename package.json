@@ -1,6 +1,6 @@
 {
     "name": "@huloglobal/vendure-plugin-review-requests",
-    "version": "0.16.0",
+    "version": "0.16.1",
     "description": "Automated post-purchase review invitations for Vendure, timed off order dates. Branded Trustpilot-style emails that link to your free Trustpilot review page (no paid Automatic Feedback Service required), with live star ratings from Trustpilot or Google, per-channel timing, customer exclusions, cooldown + dedup, opt-out, editable templates and a multi-tab admin dashboard.",
     "license": "AGPL-3.0-or-later",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",

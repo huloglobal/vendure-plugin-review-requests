@@ -4,6 +4,11 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] — 2026-10-28
+
+### Changed
+- Every install now gets a 14-day evaluation with all features on and no card (granted by the HULO licence server). The licence banner's buttons read **Subscribe**: during the evaluation the first charge falls on the day it ends, so there is no second free trial.
+
 ## [0.16.0] — 2026-10-11
 
 Retention pass: a weekly report, a set-up checklist, a dashboard widget and
