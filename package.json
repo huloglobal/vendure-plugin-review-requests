@@ -4,10 +4,10 @@
     "description": "Automated post-purchase review invitations for Vendure, timed off order dates. Branded Trustpilot-style emails that link to your free Trustpilot review page (no paid Automatic Feedback Service required), with live star ratings from Trustpilot or Google, per-channel timing, customer exclusions, cooldown + dedup, opt-out, editable templates and a multi-tab admin dashboard.",
     "license": "AGPL-3.0-or-later",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",
-    "homepage": "https://github.com/exceeded/vendure-plugin-review-requests",
+    "homepage": "https://github.com/huloglobal/vendure-plugin-review-requests",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/exceeded/vendure-plugin-review-requests.git"
+        "url": "git+https://github.com/huloglobal/vendure-plugin-review-requests.git"
     },
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
