@@ -45,5 +45,6 @@ export function wrapEmail(bodyHtml: string, businessName: string, unsubscribeUrl
 }
 
 export function escapeHtml(s: string): string {
-    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Quotes too: customer-controlled values (first name, product names) may land in an attribute of an edited template.
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }

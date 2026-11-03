@@ -2,7 +2,7 @@ import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@ne
 import type { Request, Response } from 'express';
 import { Ctx, Permission, RequestContext } from '@vendure/core';
 
-import { ReviewRequestService, PLUGIN_SHORT_ID, PREMIUM_FEATURES } from './review-request.service';
+import { ReviewRequestService, PLUGIN_SHORT_ID, PREMIUM_FEATURES, ChannelScope } from './review-request.service';
 import { ReviewRequestPlugin } from './plugin';
 import { ReviewChannelConfig } from './types';
 import { renderTemplate, wrapEmail } from './templates';
@@ -13,11 +13,41 @@ import {
 } from '@huloglobal/vendure-licence-sdk';
 
 const BUY_URL = `https://elite.charity/licence/buy/${PLUGIN_SHORT_ID}`;
+const DEFAULT_CHANNEL_CODE = '__default_channel__';
 
 function denyUnlessAdmin(ctx: RequestContext, res: Response, write: boolean | 'superadmin'): boolean {
     const needed = write === 'superadmin' ? [Permission.SuperAdmin] : write ? [Permission.UpdateSettings] : [Permission.ReadSettings];
     if (!ctx.userHasPermissions(needed)) { res.status(403).json({ error: 'forbidden' }); return true; }
     return false;
+}
+
+/**
+ * The channels an admin request may see or change. `userHasPermissions` only proves the
+ * permission on the ACTIVE channel (the `vendure-token` header), so an admin whose role
+ * covers one channel used to read and change every channel's log, config and orders.
+ * Holding the permission on the default channel (which already sees every order) means
+ * every channel; otherwise only the active channel.
+ */
+function channelScope(ctx: RequestContext, write = false): ChannelScope {
+    const needed = write ? Permission.UpdateSettings : Permission.ReadSettings;
+    const def = (ctx.session?.user?.channelPermissions || []).find(c => c.code === DEFAULT_CHANNEL_CODE);
+    if (def && (def.permissions.includes(needed) || def.permissions.includes(Permission.SuperAdmin))) return null;
+    return [Number(ctx.channelId)];
+}
+
+/** Install-wide settings (licence, weekly report, trial reminders): default-channel admins only. */
+function denyUnlessInstallAdmin(ctx: RequestContext, res: Response, write: boolean): boolean {
+    if (denyUnlessAdmin(ctx, res, write)) return true;
+    if (channelScope(ctx, write) !== null) { res.status(403).json({ error: 'forbidden', message: 'Install-wide settings need a role on the default channel.' }); return true; }
+    return false;
+}
+
+/** The channel a per-channel request targets (default: the caller's own), or null when it is outside their scope. */
+function scopedChannel(ctx: RequestContext, raw: any, write = false): number | null {
+    const scope = channelScope(ctx, write);
+    const id = Number(raw) || (scope ? scope[0] : 1);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    return !scope || scope.includes(id) ? id : null;
 }
 
 @Controller('review-requests')
@@ -140,7 +170,7 @@ export class ReviewRequestController {
 
     @Post('digest/settings')
     async digestUpdate(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         const d = this.service.getDigest();
         if (!d) return res.status(503).json({ error: 'digest-unavailable' });
         const patch: { enabled?: boolean; recipient?: string | null } = {};
@@ -152,7 +182,7 @@ export class ReviewRequestController {
 
     @Post('digest/send-test')
     async digestSendTest(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         const d = this.service.getDigest();
         if (!d) return res.status(503).json({ error: 'digest-unavailable' });
         const to = String(body?.to || '').trim().slice(0, 320);
@@ -180,7 +210,7 @@ export class ReviewRequestController {
         if (denyUnlessAdmin(ctx, res, false)) return;
         const id = Number(orderId);
         if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'bad-order-id' });
-        return res.json(await this.service.orderReviewStatus(id));
+        return res.json(await this.service.orderReviewStatus(id, channelScope(ctx)));
     }
 
     /** Manually send (or force-resend) the review invitation for one order. */
@@ -192,7 +222,7 @@ export class ReviewRequestController {
         }
         const id = Number(orderId);
         if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'bad-order-id' });
-        const result = await this.service.sendForOrder(id, !!body?.force);
+        const result = await this.service.sendForOrder(id, !!body?.force, channelScope(ctx, true));
         return res.status(result.ok ? 200 : 400).json(result);
     }
 
@@ -216,7 +246,7 @@ export class ReviewRequestController {
      *  immediately (no .env edit, no redeploy) and persisted. */
     @Post('licence/activate')
     async licenceActivate(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         const key = String(body?.key || '').trim();
         if (!key) return res.status(400).json({ licensed: false, message: 'Paste your licence key first.' });
         const status = ReviewRequestPlugin.activateRuntimeLicence(key);
@@ -228,7 +258,7 @@ export class ReviewRequestController {
     /** Remove an admin-activated key (env-configured keys are unaffected). */
     @Post('licence/deactivate')
     async licenceDeactivate(@Ctx() ctx: RequestContext, @Res() res: Response) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         await this.service.clearStoredLicenceKey();
         ReviewRequestPlugin.deactivateRuntimeLicence();
         return res.json({ licensed: false });
@@ -240,7 +270,7 @@ export class ReviewRequestController {
      *  round-trip, no .env edit, no restart. */
     @Post('licence/purchase-link')
     async licencePurchaseLink(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         const plan = (['monthly', 'annual', 'lifetime'].includes(String(body?.plan)) ? String(body.plan) : 'annual') as 'monthly' | 'annual' | 'lifetime';
         try {
             const r = await this.purchaseClaimClient().createPurchaseLink(plan, String(body?.email || '').trim() || undefined);
@@ -267,7 +297,7 @@ export class ReviewRequestController {
      *  the buy-from-admin claim or by the stored licence key itself. */
     @Post('licence/portal-link')
     async licencePortalLink(@Ctx() ctx: RequestContext, @Res() res: Response) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         let storedKey: string | null = null;
         try { storedKey = await this.service.loadStoredLicenceKey(); } catch { storedKey = null; }
         const url = await this.purchaseClaimClient().billingPortalUrl(storedKey);
@@ -300,7 +330,7 @@ export class ReviewRequestController {
      *  nothing is sent anywhere unless the admin submits an address. */
     @Post('eval/remind-me')
     async evalRemindMe(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
-        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessInstallAdmin(ctx, res, true)) return;
         const email = String(body?.email || '').trim().slice(0, 320);
         const instanceId = ReviewRequestPlugin.getEvalInstanceId();
         if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/.test(email) || !instanceId) return res.status(400).json({ error: 'bad-request' });
@@ -325,12 +355,12 @@ export class ReviewRequestController {
     @Get('config')
     async getConfig(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.getAllConfigs());
+        return res.json(await this.service.getAllConfigs(channelScope(ctx)));
     }
     @Post('config')
     async saveConfig(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { configs: ReviewChannelConfig[] }) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        const known = new Set((await this.service.getAllConfigs()).map((c: any) => Number(c.channelId)));
+        const known = new Set((await this.service.getAllConfigs(channelScope(ctx, true))).map((c: any) => Number(c.channelId)));
         const int = (v: any, min: number, max: number, dflt: number) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt; };
         const str = (v: any, max: number) => String(v ?? '').slice(0, max);
         let saved = 0;
@@ -372,15 +402,16 @@ export class ReviewRequestController {
     @Get('stats')
     async stats(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('days') days?: string) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        const stats = await this.service.stats(Number(days || 30));
+        const scope = channelScope(ctx);
+        const stats = await this.service.stats(Number(days || 30), scope);
         // Memoised for 60 s in the service — the dry-run scan used to run on every tab open.
-        const pending = await this.service.pendingSummary().catch(() => []);
+        const pending = await this.service.pendingSummary(scope).catch(() => []);
         return res.json({ ...stats, pending });
     }
     @Get('log')
     async log(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('status') status?: string) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.log(status || undefined));
+        return res.json(await this.service.log(status || undefined, 100, channelScope(ctx)));
     }
 
     // ── Admin: run now (manual trigger) ────────────────────────────────
@@ -390,7 +421,7 @@ export class ReviewRequestController {
         if (!ReviewRequestPlugin.hasPremiumAccess()) {
             return res.status(402).json({ error: 'licence_required', message: 'Your evaluation has ended — sending review requests now requires a licence.', buyUrl: BUY_URL });
         }
-        return res.json({ ok: true, results: await this.service.runAll(false) });
+        return res.json({ ok: true, results: await this.service.runAll(false, channelScope(ctx, true)) });
     }
 
     // ── Admin: templates ───────────────────────────────────────────────
@@ -399,13 +430,16 @@ export class ReviewRequestController {
     @Get('template')
     async getTemplate(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('channelId') channelId?: string) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.getTemplate(Number(channelId || 1)));
+        const ch = scopedChannel(ctx, channelId);
+        if (!ch) return res.status(403).json({ error: 'forbidden' });
+        return res.json(await this.service.getTemplate(ch));
     }
     @Post('template')
     async saveTemplate(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { channelId: number; subject: string; body: string; reset?: boolean }) {
         if (denyUnlessAdmin(ctx, res, true)) return;
         const channelId = Number(body?.channelId);
         if (!Number.isInteger(channelId) || channelId <= 0) return res.status(400).json({ ok: false, error: 'bad-channel', message: 'Unknown channel.' });
+        if (!scopedChannel(ctx, channelId, true)) return res.status(403).json({ ok: false, error: 'forbidden' });
         if (body?.reset) { await this.service.resetTemplate(channelId); return res.json({ ok: true }); }
         const subject = String(body?.subject ?? '');
         const html = String(body?.body ?? '');
@@ -423,7 +457,9 @@ export class ReviewRequestController {
     @Post('template/preview')
     async preview(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { channelId: number; subject: string; body: string }) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        const cfg = await this.service.getConfig(Number(body.channelId || 1));
+        const ch = scopedChannel(ctx, body?.channelId);
+        if (!ch) return res.status(403).json({ error: 'forbidden' });
+        const cfg = await this.service.getConfig(ch);
         const rating = await this.service.getRating(cfg);
         const businessName = cfg.businessName || cfg.trustpilotDomain || 'Your Store';
         const wantService = cfg.reviewMode === 'service' || cfg.reviewMode === 'both';
@@ -452,7 +488,9 @@ export class ReviewRequestController {
     async testSend(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { channelId: number; email: string }) {
         if (denyUnlessAdmin(ctx, res, true)) return;
         if (!body?.email) return res.status(400).json({ error: 'email required' });
-        const cfg = await this.service.getConfig(Number(body.channelId || 1));
+        const ch = scopedChannel(ctx, body.channelId, true);
+        if (!ch) return res.status(403).json({ error: 'forbidden' });
+        const cfg = await this.service.getConfig(ch);
         const result = await this.service.sendInvitation(cfg, { id: 0, code: 'TEST-1234', email: body.email, firstName: 'there' });
         return res.status(result.ok ? 200 : 500).json(result);
     }
@@ -461,7 +499,7 @@ export class ReviewRequestController {
     @Get('customers/search')
     async searchCustomers(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('q') q?: string) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.searchCustomers(q || ''));
+        return res.json(await this.service.searchCustomers(q || '', 10, channelScope(ctx)));
     }
     @Get('exclusions/check')
     async checkExclusion(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('email') email?: string) {

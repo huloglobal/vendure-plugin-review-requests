@@ -27,7 +27,12 @@ const SUBS = (dialect: 'postgres' | 'mysql'): Record<string, string | string[]> 
     'table': 'review_config',
     'column': ['reviewMode', 'productReviewUrlTemplate'],
     'ddl': `VARCHAR(400) NOT NULL DEFAULT ''`,
-    'where': ['', 'WHERE status = ?'],
+    'where': ['WHERE 1 = 1', 'WHERE status = ?'],
+    // Channel-scope fragments (0.16.2): unscoped, and scoped to one channel.
+    'chScope': ['', ' AND id IN (?)'],
+    'occScope': ['', ' AND `channelId` IN (?)'],
+    'logScope': ['', ' AND channelId IN (?)'],
+    'custScope': ['', ' AND EXISTS (SELECT 1 FROM customer_channels_channel ccc WHERE ccc.`customerId` = customer.id AND ccc.`channelId` IN (?))'],
     'Math.min(take, 500)': '100',
 });
 
@@ -49,6 +54,9 @@ const STAND_IN_DDL = [
     `CREATE TABLE "order" (id SERIAL PRIMARY KEY, code VARCHAR, state VARCHAR, "subTotalWithTax" INT, "orderPlacedAt" TIMESTAMP, "customerId" INT)`,
     `CREATE TABLE customer (id SERIAL PRIMARY KEY, "firstName" VARCHAR, "lastName" VARCHAR, "emailAddress" VARCHAR, "phoneNumber" VARCHAR, "deletedAt" TIMESTAMP, "userId" INT)`,
     `CREATE TABLE order_channels_channel ("orderId" INT, "channelId" INT, PRIMARY KEY ("orderId", "channelId"))`,
+    // licence-sdk's shared store (the unsubscribe-link secret is read/created in it directly).
+    `CREATE TABLE hulo_licence_store (pluginId VARCHAR(128) PRIMARY KEY, licenceKey TEXT NOT NULL, updatedAt TIMESTAMP NOT NULL DEFAULT NOW())`,
+    `CREATE TABLE customer_channels_channel ("customerId" INT, "channelId" INT, PRIMARY KEY ("customerId", "channelId"))`,
     `CREATE TABLE channel (id SERIAL PRIMARY KEY, code VARCHAR, token VARCHAR)`,
     `CREATE TABLE order_line (id SERIAL PRIMARY KEY, "orderId" INT, "productVariantId" INT)`,
     `CREATE TABLE product_variant (id SERIAL PRIMARY KEY, "productId" INT, "deletedAt" TIMESTAMP)`,

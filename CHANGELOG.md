@@ -4,6 +4,40 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] — 2026-11-03
+
+Security and reliability fixes. One table (`review_email_claim`) is created on boot.
+
+### Security
+- **Admin endpoints are scoped to the caller's channels.** The REST routes only
+  checked the permission on the active channel (`vendure-token`), so an
+  administrator whose role covers one channel could read every channel's send
+  log (customer emails), config (review-platform API keys), stats, templates,
+  order panels and customer search, change other channels' config and
+  templates, and send for their orders. Holding the permission on the default
+  channel still means every channel (no change for the usual admin); otherwise
+  only the active channel. Install-wide settings (licence activate/deactivate,
+  purchase and billing-portal links, weekly-report settings and test send,
+  evaluation reminders) now need a role on the default channel.
+- **Unsubscribe and click-link secret.** A failed read of the stored secret was
+  taken as "no secret yet" and the secret was overwritten, so every unsubscribe
+  and review link already sent stopped working; with the store unreachable,
+  links were signed (and accepted) with a fixed public string, so anyone could
+  unsubscribe any address. The secret is now created insert-if-absent, read
+  errors fail closed (no invitation goes out without a valid unsubscribe link,
+  and no token is accepted).
+- `escapeHtml` also escapes `"` and `'`: a customer-chosen first name placed in an
+  attribute of an edited template could add attributes (such as its own link).
+
+### Fixed
+- **Duplicate invitations for one customer.** The cooldown was checked once per
+  batch, so a customer with two due orders received two invitations in the same
+  run (typical on first enabling the plugin with a 45-day backlog), and two
+  overlapping runs (hourly cron in the worker + "Send due now" on the server)
+  could each send one. Each send now first claims the customer's address for the
+  cooldown window with an atomic insert / conditional update; the claim is
+  released if the send fails.
+
 ## [0.16.1] — 2026-10-28
 
 ### Changed

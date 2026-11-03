@@ -54,6 +54,19 @@ export interface EngagementHooks {
 
 const DAY_MS = 86_400_000;
 
+/** Channels an admin request may touch: `null` = every channel, else these ids only. */
+export type ChannelScope = number[] | null;
+
+/** ` AND <col> IN (?, …)` + params for a scope; empty for every channel. */
+function scopeFilter(scope: ChannelScope, col: string): { sql: string; params: number[] } {
+    if (!scope) return { sql: '', params: [] };
+    const ids = scope.length ? scope : [-1];
+    return { sql: ` AND ${col} IN (${ids.map(() => '?').join(',')})`, params: ids };
+}
+
+/** `hulo_licence_store` row holding the per-install HMAC secret for unsubscribe + click links. */
+const OPTOUT_SECRET_ID = 'review-requests-optout-secret';
+
 @Injectable()
 export class ReviewRequestService implements OnModuleInit {
     private options: ReviewPluginOptions = {};
@@ -287,6 +300,13 @@ export class ReviewRequestService implements OnModuleInit {
                 channelId INT NULL,
                 claimedAt DATETIME NOT NULL
             )`);
+        // One row per customer email: stamped (conditionally) before an invitation goes out so
+        // two due orders of one customer, or two overlapping runs, cannot both pass the cooldown.
+        await this.db.query(`
+            CREATE TABLE IF NOT EXISTS review_email_claim (
+                email VARCHAR(255) PRIMARY KEY,
+                claimedAt DATETIME NOT NULL
+            )`);
         await this.db.query(`
             CREATE TABLE IF NOT EXISTS review_template (
                 channelId INT PRIMARY KEY,
@@ -389,6 +409,28 @@ export class ReviewRequestService implements OnModuleInit {
         await this.db.query(`DELETE FROM review_claim WHERE orderId = ?`, [orderId]).catch(() => undefined);
     }
 
+    /** Claim a customer email for the cooldown window: true when nobody claimed it within
+     *  `cooldownDays` (insert, or a conditional re-stamp of an expired claim). Atomic across
+     *  processes; fails closed. `review_log` stays the record — this only closes the race. */
+    private async claimEmail(email: string, cooldownDays: number): Promise<boolean> {
+        try {
+            const ins = await this.db.query(
+                `INSERT IGNORE INTO review_email_claim (email, claimedAt) VALUES (?, NOW())`, [email], { needAffected: true });
+            if (Number(ins?.affectedRows ?? ins?.rowCount ?? 0) > 0) return true;
+            const upd = await this.db.query(
+                `UPDATE review_email_claim SET claimedAt = NOW() WHERE email = ? AND claimedAt <= DATE_SUB(NOW(), INTERVAL ? DAY)`,
+                [email, cooldownDays], { needAffected: true });
+            return Number(upd?.affectedRows ?? upd?.rowCount ?? 0) > 0;
+        } catch (e: any) {
+            Logger.warn(`email claim failed: ${e?.message || e}`, loggerCtx);
+            return false;
+        }
+    }
+
+    private async releaseEmailClaim(email: string): Promise<void> {
+        await this.db.query(`DELETE FROM review_email_claim WHERE email = ?`, [email]).catch(() => undefined);
+    }
+
     /** The order states at or beyond the configured trigger (an order delivered 14 days ago is no longer "PaymentSettled"). */
     static statesFor(trigger: string): string[] {
         return ({
@@ -419,8 +461,9 @@ export class ReviewRequestService implements OnModuleInit {
         };
     }
 
-    async getAllConfigs(): Promise<ReviewChannelConfig[]> {
-        const channels = await this.db.query(`SELECT id AS channelId, code AS channelCode FROM channel ORDER BY id`);
+    async getAllConfigs(scope: ChannelScope = null): Promise<ReviewChannelConfig[]> {
+        const { sql: chScope, params: chParams } = scopeFilter(scope, 'id');
+        const channels = await this.db.query(`SELECT id AS channelId, code AS channelCode FROM channel WHERE 1 = 1${chScope} ORDER BY id`, chParams);
         const rows = await this.db.query(`SELECT * FROM review_config`).catch(() => []);
         return channels.map((ch: any) => {
             const existing = rows.find((r: any) => r.channelId === ch.channelId);
@@ -464,7 +507,12 @@ export class ReviewRequestService implements OnModuleInit {
     private pendingInFlight: Promise<any[]> | null = null;
     private static readonly PENDING_TTL_MS = 60_000;
 
-    async pendingSummary(): Promise<any[]> {
+    async pendingSummary(scope: ChannelScope = null): Promise<any[]> {
+        const all = await this.pendingAll();
+        return scope ? all.filter(r => scope.includes(Number(r.channelId))) : all;
+    }
+
+    private async pendingAll(): Promise<any[]> {
         if (this.pendingCache && Date.now() - this.pendingCache.at < ReviewRequestService.PENDING_TTL_MS) return this.pendingCache.value;
         if (this.pendingInFlight) return this.pendingInFlight;
         this.pendingInFlight = this.runAll(true)
@@ -524,17 +572,19 @@ export class ReviewRequestService implements OnModuleInit {
     }
 
     /** Live customer search with a batched "already excluded?" flag per row. */
-    async searchCustomers(q: string, limit = 10): Promise<any[]> {
+    async searchCustomers(q: string, limit = 10, scope: ChannelScope = null): Promise<any[]> {
         const term = String(q || '').trim();
         if (term.length < 2) return [];
         const like = `%${term}%`;
+        const ch = scopeFilter(scope, 'ccc.\`channelId\`');
+        const custScope = scope ? ` AND EXISTS (SELECT 1 FROM customer_channels_channel ccc WHERE ccc.\`customerId\` = customer.id${ch.sql})` : '';
         const rows = await this.db.query(
             `SELECT id, \`firstName\`, \`lastName\`, \`emailAddress\` FROM customer
              WHERE \`deletedAt\` IS NULL
-               AND (\`emailAddress\` LIKE ? OR \`firstName\` LIKE ? OR \`lastName\` LIKE ? OR CONCAT(\`firstName\`, ' ', \`lastName\`) LIKE ?)
+               AND (\`emailAddress\` LIKE ? OR \`firstName\` LIKE ? OR \`lastName\` LIKE ? OR CONCAT(\`firstName\`, ' ', \`lastName\`) LIKE ?)${custScope}
              ORDER BY (LOWER(\`emailAddress\`) = ?) DESC, id DESC
              LIMIT ?`,
-            [like, like, like, like, term.toLowerCase(), Math.min(limit, 25)],
+            [like, like, like, like, ...ch.params, term.toLowerCase(), Math.min(limit, 25)],
         ).catch(() => []);
         if (!rows.length) return [];
         const emails = rows.map((r: any) => String(r.emailAddress || '').toLowerCase());
@@ -579,34 +629,45 @@ export class ReviewRequestService implements OnModuleInit {
         const configured = this.options.optOutSecret || process.env.HULO_IP_SALT;
         if (configured) return configured;
         if (this.optOutSecretCache) return this.optOutSecretCache;
-        const store = new LicenceStore((sql, params) => this.db.query(sql, params));
-        try {
-            let s = await store.load('review-requests-optout-secret');
-            if (!s) {
-                await store.save('review-requests-optout-secret', randomBytes(32).toString('hex'));
-                s = await store.load('review-requests-optout-secret'); // re-read: another process may have won
-            }
-            if (s) { this.optOutSecretCache = s; return s; }
-        } catch (e: any) {
-            Logger.warn(`optout secret store unavailable: ${e?.message}`, loggerCtx);
+        // Read errors propagate (callers fail closed): a swallowed read used to look like "no secret
+        // yet", the upsert then replaced the secret and every link already sent stopped working —
+        // and a store outage fell back to a literal anyone could sign with. Creation is
+        // insert-if-absent, so concurrent first calls (server + worker) agree on one secret.
+        await this.licenceStore.ensureTable();
+        const read = async (): Promise<string | null> => {
+            const rows: any[] = await this.db.query(`SELECT licenceKey FROM hulo_licence_store WHERE pluginId = ?`, [OPTOUT_SECRET_ID]);
+            const v = rows?.[0]?.licenceKey;
+            return typeof v === 'string' && v.length > 0 ? v : null;
+        };
+        let s = await read();
+        if (!s) {
+            await this.db.query(
+                `INSERT IGNORE INTO hulo_licence_store (pluginId, licenceKey, updatedAt) VALUES (?, ?, NOW())`,
+                [OPTOUT_SECRET_ID, randomBytes(32).toString('hex')]);
+            s = await read();
         }
-        return 'hulo-review-optout';
+        if (!s) throw new Error('unsubscribe-link secret unavailable');
+        this.optOutSecretCache = s;
+        return s;
     }
 
     async optOutToken(email: string): Promise<string> {
         const secret = await this.optOutSecret();
         return createHmac('sha256', secret).update(email.toLowerCase()).digest('hex').slice(0, 32);
     }
+    /** '' without a public base URL or when the secret is unavailable — the send then refuses. */
     async optOutUrl(email: string): Promise<string> {
         const base = (this.options.publicBaseUrl || '').replace(/\/$/, '');
         if (!base) return '';
-        return `${base}/review-requests/optout?e=${encodeURIComponent(email)}&t=${await this.optOutToken(email)}`;
+        try { return `${base}/review-requests/optout?e=${encodeURIComponent(email)}&t=${await this.optOutToken(email)}`; }
+        catch (e: any) { Logger.warn(`no unsubscribe link: ${e?.message || e}`, loggerCtx); return ''; }
     }
     /** Token check without applying (the GET confirmation page). */
     async optOutTokenValid(email: string, token: string): Promise<boolean> {
         const e = String(email || '').toLowerCase();
         if (!e || !/^[0-9a-f]{32}$/i.test(String(token || ''))) return false;
-        const expected = await this.optOutToken(e);
+        let expected: string;
+        try { expected = await this.optOutToken(e); } catch { return false; }
         try { return timingSafeEqual(Buffer.from(String(token).toLowerCase()), Buffer.from(expected)); } catch { return false; }
     }
     async optOut(email: string, token: string): Promise<boolean> {
@@ -748,7 +809,8 @@ export class ReviewRequestService implements OnModuleInit {
     private async clickUrl(logId: number): Promise<string> {
         const base = (this.options.publicBaseUrl || '').replace(/\/$/, '');
         if (!base || !logId) return '';
-        return `${base}/review-requests/r/${signClickToken(await this.optOutSecret(), logId)}`;
+        try { return `${base}/review-requests/r/${signClickToken(await this.optOutSecret(), logId)}`; }
+        catch { return ''; } // no secret: the send refuses anyway (no unsubscribe link)
     }
 
     /** Verify a click token, stamp `clickedAt` on first click and return the
@@ -977,9 +1039,22 @@ export class ReviewRequestService implements OnModuleInit {
             out.eligible++;
             if (dryRun) continue;
             if (!(await this.claimOrder(Number(o.id), cfg.channelId))) continue; // another process has it
+            // The cooldown gate above was read once for the batch: a second due order of the same
+            // customer (this run or an overlapping one) must lose here, not get its own email.
+            const emailClaimed = cfg.cooldownDays > 0;
+            if (emailClaimed && !(await this.claimEmail(email, cfg.cooldownDays))) {
+                await this.releaseClaim(Number(o.id));
+                out.eligible--;
+                await logSkipOnce('cooldown');
+                out.skipped++; continue;
+            }
             const res = await this.sendLogged(cfg, { id: o.id, code: o.code, email, firstName: o.firstName }, false);
             if (res.ok) out.sent++;
-            else { await this.releaseClaim(Number(o.id)); out.failed++; }
+            else {
+                await this.releaseClaim(Number(o.id));
+                if (emailClaimed) await this.releaseEmailClaim(email);
+                out.failed++;
+            }
           } catch (e: any) {
             Logger.error(`review invitation for order ${o?.code || o?.id} failed: ${e?.message || e}`, loggerCtx);
             out.failed++;
@@ -988,9 +1063,9 @@ export class ReviewRequestService implements OnModuleInit {
         return out;
     }
 
-    async runAll(dryRun = false): Promise<any[]> {
+    async runAll(dryRun = false, scope: ChannelScope = null): Promise<any[]> {
         // Every order also sits in the default channel: run the storefront channels first so their branding wins.
-        const configs = (await this.getAllConfigs()).slice().sort((a: any, b: any) => Number(a.channelCode === '__default_channel__') - Number(b.channelCode === '__default_channel__'));
+        const configs = (await this.getAllConfigs(scope)).slice().sort((a: any, b: any) => Number(a.channelCode === '__default_channel__') - Number(b.channelCode === '__default_channel__'));
         const results = [];
         for (const cfg of configs) {
             if (!cfg.enabled) continue;
@@ -1000,8 +1075,20 @@ export class ReviewRequestService implements OnModuleInit {
         return results;
     }
 
+    /** The scope channels an order belongs to (all of them for an unscoped caller). */
+    private async orderChannelsInScope(orderId: number, scope: ChannelScope): Promise<number[] | null> {
+        if (!scope) return null;
+        const { sql: occScope, params } = scopeFilter(scope, '\`channelId\`');
+        const rows: any[] = await this.db.query(
+            `SELECT \`channelId\` AS channelId FROM order_channels_channel WHERE \`orderId\` = ?${occScope} ORDER BY \`channelId\``,
+            [orderId, ...params]).catch(() => []);
+        return rows.map(r => Number(r.channelId));
+    }
+
     /** Per-order invitation state for the admin order-detail panel. */
-    async orderReviewStatus(orderId: number): Promise<any> {
+    async orderReviewStatus(orderId: number, scope: ChannelScope = null): Promise<any> {
+        const inScope = await this.orderChannelsInScope(orderId, scope);
+        if (inScope && !inScope.length) return { found: false };
         const [order] = await this.db.query(
             `SELECT o.id, o.code, o.state, c.\`emailAddress\` AS email, c.\`firstName\`,
                     (SELECT occ.\`channelId\` FROM order_channels_channel occ JOIN channel ch ON ch.id = occ.\`channelId\` WHERE occ.\`orderId\` = o.id ORDER BY (ch.code = '__default_channel__') ASC, occ.\`channelId\` DESC LIMIT 1) AS channelId
@@ -1025,7 +1112,9 @@ export class ReviewRequestService implements OnModuleInit {
     /** Manual send from the admin order page. Opt-outs are ALWAYS
      *  honoured; `force` re-sends an already-invited order and overrides
      *  exclusions (an explicit staff decision). */
-    async sendForOrder(orderId: number, force = false): Promise<{ ok: boolean; reason?: string }> {
+    async sendForOrder(orderId: number, force = false, scope: ChannelScope = null): Promise<{ ok: boolean; reason?: string }> {
+        const inScope = await this.orderChannelsInScope(orderId, scope);
+        if (inScope && !inScope.length) return { ok: false, reason: 'Order not found' };
         const [o] = await this.db.query(
             `SELECT o.id, o.code, c.\`emailAddress\` AS email, c.\`firstName\`,
                     (SELECT occ.\`channelId\` FROM order_channels_channel occ JOIN channel ch ON ch.id = occ.\`channelId\` WHERE occ.\`orderId\` = o.id ORDER BY (ch.code = '__default_channel__') ASC, occ.\`channelId\` DESC LIMIT 1) AS channelId
@@ -1040,7 +1129,8 @@ export class ReviewRequestService implements OnModuleInit {
             if (prior) return { ok: false, reason: 'Already sent for this order — use Resend to send again' };
             if (await this.isExcluded(email)) return { ok: false, reason: 'Customer/domain is excluded — use Resend to override' };
         }
-        const cfg = await this.getConfig(o.channelId);
+        // A channel-scoped admin sends with their own channel's settings and branding.
+        const cfg = await this.getConfig(inScope ? inScope[0] : o.channelId);
         if (!cfg) return { ok: false, reason: 'No review configuration for this channel' };
         if (!force && !(await this.claimOrder(Number(o.id), cfg.channelId))) return { ok: false, reason: 'An invitation for this order is already being sent' };
         const res = await this.sendLogged(cfg, { id: o.id, code: o.code, email, firstName: o.firstName }, true);
@@ -1050,25 +1140,27 @@ export class ReviewRequestService implements OnModuleInit {
     }
 
     // ── Stats + log for the admin ───────────────────────────────────────
-    async stats(days = 30): Promise<any> {
+    async stats(days = 30, scope: ChannelScope = null): Promise<any> {
         const d = Math.max(1, Math.min(days, 365));
+        const { sql: logScope, params: lp } = scopeFilter(scope, 'channelId');
         // `clicked` counts invitations from this window whose review link was opened — the click-through denominator is `sent`.
         const [totals] = await this.db.query(
             `SELECT SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent, SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
                     SUM(CASE WHEN clickedAt IS NOT NULL THEN 1 ELSE 0 END) AS clicked
-             FROM review_log WHERE createdAt > DATE_SUB(NOW(), INTERVAL ? DAY)`, [d]);
+             FROM review_log WHERE createdAt > DATE_SUB(NOW(), INTERVAL ? DAY)${logScope}`, [d, ...lp]);
         const daily = await this.db.query(
             `SELECT DATE(createdAt) AS day, SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent
-             FROM review_log WHERE createdAt > DATE_SUB(NOW(), INTERVAL ? DAY) GROUP BY DATE(createdAt) ORDER BY day`, [d]);
+             FROM review_log WHERE createdAt > DATE_SUB(NOW(), INTERVAL ? DAY)${logScope} GROUP BY DATE(createdAt) ORDER BY day`, [d, ...lp]);
         const [optouts] = await this.db.query(`SELECT COUNT(*) AS n FROM review_optout`);
         return { totals: totals || {}, daily, optOuts: Number(optouts?.n || 0) };
     }
 
-    async log(status?: string, take = 100): Promise<any[]> {
-        const where = status ? `WHERE status = ?` : '';
+    async log(status?: string, take = 100, scope: ChannelScope = null): Promise<any[]> {
+        const { sql: logScope, params } = scopeFilter(scope, 'channelId');
+        const where = status ? `WHERE status = ?` : 'WHERE 1 = 1';
         return this.db.query(
-            `SELECT * FROM review_log ${where} ORDER BY createdAt DESC LIMIT ${Math.min(take, 500)}`,
-            status ? [status] : [],
+            `SELECT * FROM review_log ${where}${logScope} ORDER BY createdAt DESC LIMIT ${Math.min(take, 500)}`,
+            [...(status ? [status] : []), ...params],
         ).catch(() => []);
     }
 }

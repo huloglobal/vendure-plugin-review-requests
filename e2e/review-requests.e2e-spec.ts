@@ -1,5 +1,7 @@
 import { mergeConfig } from '@vendure/core';
 import { createTestEnvironment, registerInitializer, MysqlInitializer, testConfig } from '@vendure/testing';
+import gql from 'graphql-tag';
+import { createHmac } from 'crypto';
 import { initialData } from '../../../e2e-shared/initial-data';
 import { ReviewRequestPlugin } from '../src/plugin';
 import { ReviewRequestService } from '../src/review-request.service';
@@ -28,10 +30,52 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
         },
         plugins: [ReviewRequestPlugin.init({ publicBaseUrl: BASE, optOutSecret: 'e2e-secret' })],
     });
-    const { server } = createTestEnvironment(config);
+    const { server, adminClient } = createTestEnvironment(config);
     beforeAll(async () => { await server.init({ initialData, productsCsvPath: '', customerCount: 0 } as any); }, 120_000);
     afterAll(async () => { await server.destroy(); });
     const svc = () => (server as any).app.get(ReviewRequestService) as ReviewRequestService;
+
+    /** Insert a row, filling every NOT NULL column without a default (Vendure entities have many). */
+    async function insertRow(table: string, values: Record<string, any>): Promise<number> {
+        const db = (svc() as any).db;
+        const cols: any[] = await db.query(
+            `SELECT COLUMN_NAME AS name, DATA_TYPE AS type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS dflt, EXTRA AS extra
+             FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?`, [table]);
+        const row: Record<string, any> = { ...values };
+        for (const c of cols) {
+            if (c.name in row || c.nullable === 'YES' || (c.dflt !== null && c.dflt !== undefined) || /auto_increment/i.test(c.extra || '')) continue;
+            row[c.name] = /int|decimal|double|float/i.test(c.type) ? 0 : /date|time/i.test(c.type) ? new Date() : '';
+        }
+        const keys = Object.keys(row);
+        const r = await db.query(`INSERT INTO \`${table}\` (${keys.map(k => `\`${k}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`, keys.map(k => row[k]));
+        return Number(r.insertId);
+    }
+    async function seedCustomer(email: string, firstName = 'Sam'): Promise<number> {
+        return insertRow('customer', { firstName, lastName: 'Tester', emailAddress: email });
+    }
+    /** A Delivered order placed `daysAgo` days ago, in the given channels. */
+    let orderIdsBumped = false;
+    async function seedOrder(customerId: number, channelIds: number[], daysAgo = 25): Promise<number> {
+        // Earlier tests write review_log rows for low order ids (1, 2, 3, …): keep seeded orders clear of them.
+        if (!orderIdsBumped) { await (svc() as any).db.query('ALTER TABLE `order` AUTO_INCREMENT = 100000'); orderIdsBumped = true; }
+        const code = 'E2E' + Math.random().toString(36).slice(2, 12).toUpperCase();
+        const id = await insertRow('order', {
+            code, state: 'Delivered', active: 0, customerId, subTotal: 4000, subTotalWithTax: 4800,
+            orderPlacedAt: new Date(Date.now() - daysAgo * 86_400_000), currencyCode: 'GBP', type: 'Regular',
+        });
+        for (const ch of channelIds) await (svc() as any).db.query('INSERT INTO order_channels_channel (orderId, channelId) VALUES (?, ?)', [id, ch]);
+        return id;
+    }
+    /** Route the service's SMTP to an in-memory recorder for the duration of `fn` (no real mail). */
+    async function withFakeSmtp<T>(fn: (sent: any[]) => Promise<T>): Promise<T> {
+        const s0 = svc() as any;
+        const sent: any[] = [];
+        const opts = s0.getOptions();
+        s0.setOptions({ ...opts, smtp: { host: 'smtp.invalid', port: 587, from: 'reviews@shop.test' } });
+        s0.transporter = () => ({ sendMail: async (m: any) => { sent.push(m); return { messageId: String(sent.length) }; }, close: () => undefined });
+        try { return await fn(sent); }
+        finally { s0.setOptions(opts); delete s0.transporter; }
+    }
 
     it('admin endpoints reject anonymous callers', async () => {
         for (const p of ['config', 'stats', 'log', 'template', 'exclusions', 'meta']) {
@@ -187,5 +231,151 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
         expect((await svc().getTemplate(1)).isDefault).toBe(false);
         await svc().resetTemplate(1);
         expect((await svc().getTemplate(1)).isDefault).toBe(true);
+    });
+
+    // ── 0.16.2 regressions ─────────────────────────────────────────────
+
+    it('two due orders for one customer get ONE invitation (cooldown) — in one run and across concurrent runs', async () => {
+        const cfg = { ...(await svc().getConfig(1)), enabled: true, delayDays: 21, cooldownDays: 120 };
+        await withFakeSmtp(async sent => {
+            // Same run: both orders come back from the candidate query together.
+            const c1 = await seedCustomer('twice@example.com');
+            await seedOrder(c1, [1]); await seedOrder(c1, [1]);
+            await svc().runChannel(cfg);
+            expect(sent.filter(m => m.to === 'twice@example.com')).toHaveLength(1);
+
+            // Two overlapping runs (hourly cron in the worker + "Send due now" on the server).
+            const c2 = await seedCustomer('race@example.com');
+            await seedOrder(c2, [1]); await seedOrder(c2, [1]);
+            await Promise.all([svc().runChannel(cfg), svc().runChannel(cfg)]);
+            expect(sent.filter(m => m.to === 'race@example.com')).toHaveLength(1);
+        });
+    });
+
+    it('unsubscribe secret: a failed read neither rotates the stored secret nor falls back to a public literal', async () => {
+        const s0 = svc() as any;
+        const opts = s0.getOptions();
+        const salt = process.env.HULO_IP_SALT;
+        delete process.env.HULO_IP_SALT;
+        s0.setOptions({ ...opts, optOutSecret: undefined });
+        s0.optOutSecretCache = null;
+        const real = s0.db;
+        const stored = async () => (await real.query(`SELECT licenceKey FROM hulo_licence_store WHERE pluginId = 'review-requests-optout-secret'`))[0]?.licenceKey;
+        try {
+            const tok = await s0.optOutToken('keep@example.com');
+            const secret = await stored();
+            expect(secret).toMatch(/^[0-9a-f]{64}$/);
+
+            // A transient read failure (SELECT only) must not overwrite the secret every sent link is signed with.
+            s0.optOutSecretCache = null;
+            let failReads = true;
+            Object.defineProperty(s0, 'db', { configurable: true, get: () => ({
+                dialect: real.dialect,
+                query: (sql: string, p?: any[], o?: any) => failReads && /^\s*SELECT[\s\S]*hulo_licence_store/i.test(sql) ? (failReads = false, Promise.reject(new Error('connection lost'))) : real.query(sql, p, o),
+            }) });
+            await s0.optOutToken('keep@example.com').catch(() => null);
+            expect(await stored()).toBe(secret);
+            s0.optOutSecretCache = null;
+            expect(await s0.optOutTokenValid('keep@example.com', tok)).toBe(true); // old links still work
+
+            // Store fully down: a token made with the old shared literal must not be accepted.
+            s0.optOutSecretCache = null;
+            Object.defineProperty(s0, 'db', { configurable: true, get: () => ({
+                dialect: real.dialect,
+                query: (sql: string, p?: any[], o?: any) => /hulo_licence_store/.test(sql) ? Promise.reject(new Error('connection lost')) : real.query(sql, p, o),
+            }) });
+            const forged = createHmac('sha256', 'hulo-review-optout').update('victim@example.com').digest('hex').slice(0, 32);
+            expect(await s0.optOutTokenValid('victim@example.com', forged)).toBe(false);
+            expect(await s0.optOutUrl('victim@example.com')).toBe(''); // → the send refuses rather than mailing a forgeable link
+        } finally {
+            delete s0.db;
+            s0.optOutSecretCache = null;
+            s0.setOptions(opts);
+            if (salt !== undefined) process.env.HULO_IP_SALT = salt;
+        }
+    });
+
+    describe('channel scoping (an admin whose role covers only channel 2)', () => {
+        let ch2 = 0;
+        let scopedToken = '';
+        let superToken = '';
+        let ch1Order = 0;
+        const call = (path: string, token: string, init: RequestInit = {}, channelToken: string | null = 'rr-second-token') => fetch(`${BASE}/review-requests/${path}`, {
+            ...init,
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(channelToken ? { 'vendure-token': channelToken } : {}), ...(init.headers || {}) },
+        });
+
+        beforeAll(async () => {
+            await adminClient.asSuperAdmin();
+            const { createChannel } = await adminClient.query(gql`
+                mutation {
+                    createChannel(input: {
+                        code: "rr-second", token: "rr-second-token", defaultLanguageCode: en,
+                        pricesIncludeTax: false, currencyCode: GBP, defaultCurrencyCode: GBP,
+                        defaultShippingZoneId: "1", defaultTaxZoneId: "1"
+                    }) { ... on Channel { id } ... on ErrorResult { message } }
+                }`);
+            ch2 = Number(String(createChannel.id).replace(/^T_/, '')); // the testing id strategy returns "T_<n>"
+            const { createRole } = await adminClient.query(gql`
+                mutation($ch: ID!) {
+                    createRole(input: { code: "rr-ch2-admin", description: "ch2", permissions: [ReadSettings, UpdateSettings, ReadOrder], channelIds: [$ch] }) { id }
+                }`, { ch: createChannel.id });
+            await adminClient.query(gql`
+                mutation($role: ID!) {
+                    createAdministrator(input: { firstName: "Ch", lastName: "Two", emailAddress: "rr-ch2@test", password: "ch2pass", roleIds: [$role] }) { id }
+                }`, { role: createRole.id });
+            // Logged in with a plain fetch: the shared client logs out its current session on every login.
+            const login = await fetch(`${BASE}/admin-api`, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ query: 'mutation { login(username: "rr-ch2@test", password: "ch2pass") { ... on CurrentUser { id } } }' }),
+            });
+            scopedToken = String(login.headers.get('vendure-auth-token') || '');
+            expect(scopedToken).not.toBe('');
+            await adminClient.asSuperAdmin(); // fresh session: its channel permissions include channel 2
+            superToken = adminClient.getAuthToken();
+
+            await svc().logSend(900001, 'CH1SECRET', 1, 'channel-one-customer@example.com', 'sent', '', 'https://www.trustpilot.com/evaluate/one.test');
+            await svc().logSend(900002, 'CH2OWN', ch2, 'channel-two-customer@example.com', 'sent', '', 'https://www.trustpilot.com/evaluate/two.test');
+            ch1Order = await seedOrder(await seedCustomer('ch1-order@example.com'), [1], 3);
+        });
+
+        it('the log and config only show channel 2', async () => {
+            const log = await call('log', scopedToken);
+            expect(log.status).toBe(200);
+            const text = await log.text();
+            expect(text).toContain('channel-two-customer@example.com');
+            expect(text).not.toContain('channel-one-customer@example.com');
+
+            const cfg: any[] = await (await call('config', scopedToken)).json();
+            expect(cfg.map(c => Number(c.channelId))).toEqual([ch2]);
+        });
+
+        it('cannot read or change channel 1 templates, config or orders', async () => {
+            expect((await call('template?channelId=1', scopedToken)).status).toBe(403);
+            expect((await call('template', scopedToken, { method: 'POST', body: JSON.stringify({ channelId: 1, subject: 'x', body: '<p>x</p>' }) })).status).toBe(403);
+            const saved = await (await call('config', scopedToken, { method: 'POST', body: JSON.stringify({ configs: [{ channelId: 1, enabled: false }] }) })).json();
+            expect(saved.rejected).toContain(1);
+            expect(saved.saved).toBe(0);
+            expect(await (await call(`order-status/${ch1Order}`, scopedToken)).json()).toEqual({ found: false });
+            const sendRes = await call(`send-order/${ch1Order}`, scopedToken, { method: 'POST', body: '{}' });
+            expect([400, 402, 404]).toContain(sendRes.status);
+            if (sendRes.status !== 402) expect((await sendRes.json()).reason).toBe('Order not found');
+            expect(await svc().sendForOrder(ch1Order, true, [ch2])).toEqual({ ok: false, reason: 'Order not found' }); // past the licence gate too
+        });
+
+        it('cannot change install-wide settings (licence, weekly report)', async () => {
+            expect((await call('licence/deactivate', scopedToken, { method: 'POST', body: '{}' })).status).toBe(403);
+            expect((await call('digest/settings', scopedToken, { method: 'POST', body: JSON.stringify({ enabled: false }) })).status).toBe(403);
+        });
+
+        it('a default-channel (super) admin still sees every channel, whatever channel token the UI sends', async () => {
+            const text = await (await call('log', superToken)).text();
+            expect(text).toContain('channel-one-customer@example.com');
+            expect(text).toContain('channel-two-customer@example.com');
+            const cfg: any[] = await (await call('config', superToken)).json();
+            expect(cfg.map(c => Number(c.channelId))).toEqual(expect.arrayContaining([1, ch2]));
+            expect((await call(`order-status/${ch1Order}`, superToken)).status).toBe(200);
+            expect((await (await call(`order-status/${ch1Order}`, superToken)).json()).found).toBe(true);
+        });
     });
 });
