@@ -4,6 +4,11 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.3] — 2026-11-04
+
+### Documentation
+- The README now shows the plugin logo, hosted on huloglobal.com so it displays on npm and GitHub alike, linking to the product page. No code changes.
+
 ## [0.16.2] — 2026-11-03
 
 Security and reliability fixes. One table (`review_email_claim`) is created on boot.
