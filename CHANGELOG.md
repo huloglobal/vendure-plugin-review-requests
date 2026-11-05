@@ -4,6 +4,13 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.5] — 2026-11-05
+
+### Package metadata
+- The `license` field is now `AGPL-3.0-only`, matching `LICENSE`, which grants the GNU Affero
+  General Public License version 3 (it said `AGPL-3.0-or-later`). Published npm builds remain under the
+  separate commercial licence described in `LICENSE`. No code changes.
+
 ## [0.16.4] — 2026-11-04
 
 ### Fixed
