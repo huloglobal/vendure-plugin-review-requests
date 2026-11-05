@@ -77,7 +77,7 @@ export class ReviewRequestService implements OnModuleInit {
 
     private get db() { return adapterFor(this.connection.rawConnection); }
 
-    private licenceStore = new LicenceStore((sql, params) => this.db.query(sql, params));
+    private licenceStore = new LicenceStore((sql, params, opts) => this.db.query(sql, params, opts));
 
     // Buy-from-admin auto-install (hooks are supplied by the controller so
     // this file never imports the plugin class).

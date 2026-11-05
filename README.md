@@ -1,4 +1,4 @@
-<p align="center"><a href="https://huloglobal.com/vendure-plugins/review-requests/"><img src="https://huloglobal.com/vendure-plugins/logos/review-requests.svg" width="96" height="96" alt="HULO Review Requests logo"></a></p>
+<p align="center"><a href="https://huloglobal.com/vendure-plugins/review-requests/"><img src="https://huloglobal.com/vendure-plugins/logos/review-requests.svg?v=2" width="96" height="96" alt="HULO Review Requests logo"></a></p>
 
 # @huloglobal/vendure-plugin-review-requests
 

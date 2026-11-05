@@ -1,10 +1,10 @@
 {
     "name": "@huloglobal/vendure-plugin-review-requests",
-    "version": "0.16.3",
-    "description": "Automated post-purchase review invitations for Vendure, timed off order dates. Branded Trustpilot-style emails that link to your free Trustpilot review page (no paid Automatic Feedback Service required), with live star ratings from Trustpilot or Google, per-channel timing, customer exclusions, cooldown + dedup, opt-out, editable templates and a multi-tab admin dashboard.",
+    "version": "0.16.4",
+    "description": "Automated post-purchase review invitations for Vendure, timed off order dates: a branded email linking to your free Trustpilot page, Google reviews or any review site, with exclusions, a cooldown, one-click unsubscribe and click tracking.",
     "license": "AGPL-3.0-or-later",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",
-    "homepage": "https://github.com/huloglobal/vendure-plugin-review-requests",
+    "homepage": "https://huloglobal.com/vendure-plugins/review-requests/",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/huloglobal/vendure-plugin-review-requests.git"
@@ -23,13 +23,13 @@
         "hulo-global-logo-dark.svg"
     ],
     "scripts": {
-        "build": "tsc -p tsconfig.json",
+        "build": "tsc -p tsconfig.build.json",
         "prepublishOnly": "yarn build",
         "test": "vitest run",
         "test:watch": "vitest"
     },
     "dependencies": {
-        "@huloglobal/vendure-licence-sdk": "^0.15.1"
+        "@huloglobal/vendure-licence-sdk": "^0.15.4"
     },
     "peerDependencies": {
         "@vendure/core": ">=3.5.0 <4.0.0",
@@ -51,11 +51,12 @@
     "keywords": [
         "vendure",
         "vendure-plugin",
-        "trustpilot",
         "reviews",
+        "customer-reviews",
         "review-request",
+        "trustpilot",
+        "google-reviews",
         "post-purchase",
-        "email",
-        "nps"
+        "email"
     ]
 }

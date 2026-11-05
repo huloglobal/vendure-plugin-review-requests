@@ -4,6 +4,17 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.4] — 2026-11-04
+
+### Fixed
+- **PostgreSQL: the per-address cooldown holds.** With licence SDK 0.15.3 or older, the cooldown claim always looked successful on Postgres, so two overlapping runs could both invite the same customer inside the cooldown. The plugin now requires licence SDK `^0.15.4`. The first weekly report is no longer skipped either (it used to start a week late). MySQL and MariaDB were not affected.
+- **PostgreSQL: a licence key activated in the admin is now stored.** The plugin's licence store left out the conflict column that the Postgres upsert needs, so saving a key failed. Pasting a key into the admin applied it, answered with a server error and did not store it, so the plugin was unlicensed again after a restart. A key bought from the admin, which installs itself, was not stored either. MySQL and MariaDB were not affected.
+
+### Package metadata
+- `homepage` is now the product page, https://huloglobal.com/vendure-plugins/review-requests/, instead of the GitHub repository.
+- A shorter `description` that npm shows in full (npm cuts descriptions at 255 characters). Keywords drop `nps` (the plugin sends no NPS surveys) and add `customer-reviews` and `google-reviews`.
+- The npm package no longer includes the plugin's compiled unit tests.
+
 ## [0.16.3] — 2026-11-04
 
 ### Documentation
