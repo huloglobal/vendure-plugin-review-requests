@@ -25,6 +25,18 @@ export const DEFAULT_TEMPLATE: Template = {
 <p style="margin:0;line-height:1.6">— The {{businessName}} team</p>`,
 };
 
+/** The built-in e-mail for a customer from a list (no order to mention). */
+export const DEFAULT_LIST_BODY = `<p style="margin:0 0 14px;line-height:1.6">Hi {{firstName}},</p>
+<p style="margin:0 0 14px;line-height:1.6">Thank you for choosing {{businessName}}. We hope you're happy with everything.</p>
+<p style="margin:0 0 18px;line-height:1.6">Reviews genuinely help a small business like ours — and help other shoppers buy with confidence. If you have a spare minute, we'd love to hear how we did:</p>
+{{ratingBlock}}
+{{reviewButton}}
+<p style="margin:0 0 14px;line-height:1.6">It only takes a moment, and it means a lot. Thank you!</p>
+<p style="margin:0;line-height:1.6">— The {{businessName}} team</p>`;
+
+/** The built-in subject for a customer whose name is not known ("How did we do?" rather than "How did we do, there?"). */
+export const DEFAULT_SUBJECT_NO_NAME = 'How did we do? Leave {{businessName}} a quick review';
+
 export function renderTemplate(tpl: string, vars: Record<string, string | number | undefined>): string {
     return tpl.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => {
         const v = vars[k];

@@ -2,7 +2,9 @@ import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@ne
 import type { Request, Response } from 'express';
 import { Ctx, Permission, RequestContext } from '@vendure/core';
 
-import { ReviewRequestService, PLUGIN_SHORT_ID, PREMIUM_FEATURES, ChannelScope } from './review-request.service';
+import { ReviewRequestService, PLUGIN_SHORT_ID, PREMIUM_FEATURES, ChannelScope, bulkSummary } from './review-request.service';
+import { reviewPageProblem, validateReviewPage } from './review-page';
+import { MAX_LIST_BYTES } from './list-parser';
 import { ReviewRequestPlugin } from './plugin';
 import { ReviewChannelConfig } from './types';
 import { renderTemplate, wrapEmail } from './templates';
@@ -13,6 +15,36 @@ import {
 } from '@huloglobal/vendure-licence-sdk';
 
 const BUY_URL = `https://elite.charity/licence/buy/${PLUGIN_SHORT_ID}`;
+
+/** 402 for a premium feature without a licence or an active evaluation; true when refused. */
+function denyUnlessPremium(res: Response, what: string): boolean {
+    if (ReviewRequestPlugin.hasPremiumAccess()) return false;
+    res.status(402).json({ error: 'licence_required', message: `${what} needs a licence (or an active evaluation).`, buyUrl: BUY_URL });
+    return true;
+}
+
+/** A text body (a pasted or CSV list) up to `max` bytes: sent as text/plain or text/csv (read here,
+ *  so the host's JSON size limit does not apply), or as JSON `{ text }`. null when too large. */
+function readTextBody(req: Request, max: number): Promise<string | null> {
+    const parsed: any = (req as any).body;
+    if (typeof parsed === 'string') return Promise.resolve(Buffer.byteLength(parsed) > max ? null : parsed);
+    if ((req as any).readableEnded || !(req as any).readable) {
+        const t = parsed && typeof parsed.text === 'string' ? parsed.text : '';
+        return Promise.resolve(Buffer.byteLength(t) > max ? null : t);
+    }
+    return new Promise(resolve => {
+        const chunks: Buffer[] = [];
+        let size = 0; let done = false;
+        const finish = (v: string | null) => { if (!done) { done = true; resolve(v); } };
+        req.on('data', (c: Buffer) => {
+            size += c.length;
+            if (size > max) { finish(null); req.removeAllListeners('data'); req.resume(); return; }
+            chunks.push(c);
+        });
+        req.on('end', () => finish(Buffer.concat(chunks).toString('utf8')));
+        req.on('error', () => finish(null));
+    });
+}
 const DEFAULT_CHANNEL_CODE = '__default_channel__';
 
 function denyUnlessAdmin(ctx: RequestContext, res: Response, write: boolean | 'superadmin'): boolean {
@@ -128,6 +160,7 @@ export class ReviewRequestController {
             eval: evalState,
             notice: licenceLifecycleNotice(summary, evalState, PLUGIN_SHORT_ID),
             premiumFeatures: PREMIUM_FEATURES,
+            premium: ReviewRequestPlugin.hasPremiumAccess(),
             recentStats: recent.map(s => ({ label: s.label, value: formatStat(s) })),
             buyUrl: BUY_URL,
         });
@@ -137,7 +170,9 @@ export class ReviewRequestController {
     @Get('setup')
     async setup(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.setupChecklist());
+        // The set-up checklist is premium (0.17.0): without a licence or evaluation it is not shown.
+        if (!ReviewRequestPlugin.hasPremiumAccess()) return res.json({ items: [], complete: true, locked: true });
+        return res.json({ ...(await this.service.setupChecklist()), locked: false });
     }
 
     /** Three headline figures for the last 7 days — light enough for the dashboard. */
@@ -165,7 +200,8 @@ export class ReviewRequestController {
         if (denyUnlessAdmin(ctx, res, false)) return;
         const d = this.service.getDigest();
         if (!d) return res.status(503).json({ error: 'digest-unavailable' });
-        return res.json(await d.settings());
+        // Premium (0.17.0): without a licence or evaluation the report is not sent; settings are kept.
+        return res.json({ ...(await d.settings()), premium: ReviewRequestPlugin.hasPremiumAccess() });
     }
 
     @Post('digest/settings')
@@ -183,6 +219,7 @@ export class ReviewRequestController {
     @Post('digest/send-test')
     async digestSendTest(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
         if (denyUnlessInstallAdmin(ctx, res, true)) return;
+        if (denyUnlessPremium(res, 'The weekly report')) return;
         const d = this.service.getDigest();
         if (!d) return res.status(503).json({ error: 'digest-unavailable' });
         const to = String(body?.to || '').trim().slice(0, 320);
@@ -195,6 +232,7 @@ export class ReviewRequestController {
     @Get('digest/preview')
     async digestPreview(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (denyUnlessAdmin(ctx, res, false)) return;
+        if (denyUnlessPremium(res, 'The weekly report')) return;
         try {
             const mail = await this.service.digestPreview();
             res.setHeader('cache-control', 'no-store');
@@ -213,17 +251,82 @@ export class ReviewRequestController {
         return res.json(await this.service.orderReviewStatus(id, channelScope(ctx)));
     }
 
-    /** Manually send (or force-resend) the review invitation for one order. */
+    /** Send the review invitation for one order (free since 0.17.0: opt-outs, exclusions, the
+     *  cooldown and the hourly limit apply), or force-resend it (`force`, premium: overrides a
+     *  previous invitation, exclusions and the cooldown; never an opt-out). */
     @Post('send-order/:orderId')
     async sendOrder(@Ctx() ctx: RequestContext, @Res() res: Response, @Param('orderId') orderId: string, @Body() body: any) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        if (!ReviewRequestPlugin.hasPremiumAccess()) {
-            return res.status(402).json({ error: 'licence_required', message: 'Sending review requests requires a licence (or an active evaluation).', buyUrl: BUY_URL });
-        }
+        const force = body?.force === true;
+        if (force && denyUnlessPremium(res, 'Resend')) return;
         const id = Number(orderId);
-        if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'bad-order-id' });
-        const result = await this.service.sendForOrder(id, !!body?.force, channelScope(ctx, true));
+        if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'bad-order-id' });
+        const result = await this.service.sendForOrder(id, force, channelScope(ctx, true));
         return res.status(result.ok ? 200 : 400).json(result);
+    }
+
+    // ── Admin: staff sends to many customers (premium) ─────────────────
+    /** The orders-list bulk action: the first 20 now, the rest in the background. */
+    @Post('bulk-send')
+    async bulkSend(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
+        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessPremium(res, 'Sending review invitations for many orders at once')) return;
+        const ids = Array.isArray(body?.orderIds) ? body.orderIds.slice(0, 1000) : [];
+        if (!ids.length) return res.status(400).json({ error: 'bad-request', message: 'Select at least one order.' });
+        const r = await this.service.bulkSendOrders(ids, channelScope(ctx, true));
+        return res.json({ ...r, message: bulkSummary(r) });
+    }
+
+    /** A pasted or CSV list (text/plain or text/csv body, up to 1 MB; or JSON { text }):
+     *  `?channelId=…&mode=now|schedule`. */
+    @Post('lists')
+    async sendList(@Ctx() ctx: RequestContext, @Req() req: Request, @Res() res: Response, @Query('channelId') channelId?: string, @Query('mode') mode?: string) {
+        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessPremium(res, 'Inviting customers from a list')) return;
+        const ch = scopedChannel(ctx, channelId, true);
+        if (!ch) return res.status(403).json({ error: 'forbidden' });
+        const text = await readTextBody(req, MAX_LIST_BYTES);
+        if (text === null) return res.status(413).json({ error: 'too-large', message: 'The list is larger than 1 MB. Split it into smaller lists.' });
+        if (!text.trim()) return res.status(400).json({ error: 'bad-request', message: 'Paste a list or choose a CSV file first.' });
+        const r = await this.service.sendList(ch, text, mode === 'schedule' ? 'schedule' : 'now');
+        return res.status(r.ok ? 200 : 400).json(r);
+    }
+
+    /** "Not invited yet": recent orders without an invitation, scheduled list rows, the outbox. */
+    @Get('not-invited')
+    async notInvited(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (denyUnlessAdmin(ctx, res, false)) return;
+        if (denyUnlessPremium(res, 'The "Not invited yet" list')) return;
+        return res.json(await this.service.notInvited(channelScope(ctx), 100));
+    }
+
+    @Post('invite-selected')
+    async inviteSelected(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
+        if (denyUnlessAdmin(ctx, res, true)) return;
+        if (denyUnlessPremium(res, 'Invite selected')) return;
+        const orderIds = Array.isArray(body?.orderIds) ? body.orderIds.slice(0, 1000) : [];
+        const queueIds = Array.isArray(body?.queueIds) ? body.queueIds.slice(0, 1000) : [];
+        if (!orderIds.length && !queueIds.length) return res.status(400).json({ error: 'bad-request', message: 'Select at least one customer.' });
+        const r = await this.service.inviteSelected(orderIds, queueIds, channelScope(ctx, true));
+        return res.json({ ...r, message: bulkSummary(r) });
+    }
+
+    /** Remove a scheduled (or waiting) list row before it goes out. */
+    @Delete('queue/:id')
+    async cancelQueued(@Ctx() ctx: RequestContext, @Res() res: Response, @Param('id') id: string) {
+        if (denyUnlessAdmin(ctx, res, true)) return;
+        const n = Number(id);
+        if (!Number.isInteger(n) || n <= 0) return res.status(400).json({ error: 'bad-id' });
+        return res.json({ ok: await this.service.cancelQueued(n, channelScope(ctx, true)) });
+    }
+
+    /** Customers who used the unsubscribe link (free). Opt-outs are install-wide (any channel's
+     *  customers), so only default-channel admins see the list; a channel-scoped admin can still
+     *  check one address with `exclusions/check`. */
+    @Get('optouts')
+    async optOuts(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('q') q?: string) {
+        if (denyUnlessInstallAdmin(ctx, res, false)) return;
+        return res.json(await this.service.listOptOuts(String(q || ''), 200));
     }
 
     /** One-click in-app update (owner-approved feature): installs a
@@ -363,30 +466,45 @@ export class ReviewRequestController {
         const known = new Set((await this.service.getAllConfigs(channelScope(ctx, true))).map((c: any) => Number(c.channelId)));
         const int = (v: any, min: number, max: number, dflt: number) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt; };
         const str = (v: any, max: number) => String(v ?? '').slice(0, max);
+        const cleanUrl = (v: string) => (/^https?:\/\/[^\s<>"']+$/i.test(v.trim()) ? v.trim() : '');
         let saved = 0;
         const rejected: number[] = [];
+        const errors: Array<{ channelId: number; message: string }> = [];
         for (const raw of (Array.isArray(body?.configs) ? body.configs : []).slice(0, 50)) {
             const channelId = Number(raw?.channelId);
             if (!known.has(channelId)) { rejected.push(channelId); continue; }
+            // The review page (B6): a named platform gets its current link format and an identifier it
+            // can use (else none is kept and the page reads "not set"); a custom link must be http(s).
+            const previous = await this.service.getConfig(channelId);
+            const page = validateReviewPage({ reviewUrlTemplate: str(raw.reviewUrlTemplate, 400), trustpilotDomain: str(raw.trustpilotDomain, 400) }, previous.reviewUrlTemplate);
+            for (const m of page.errors) errors.push({ channelId, message: m });
             const c: ReviewChannelConfig = {
                 ...raw, channelId,
                 enabled: !!raw.enabled,
                 triggerState: (['Delivered', 'PaymentSettled', 'Shipped'].includes(raw.triggerState) ? raw.triggerState : 'Delivered'),
                 delayDays: int(raw.delayDays, 0, 365, 14), cooldownDays: int(raw.cooldownDays, 0, 3650, 120),
                 maxPerRun: int(raw.maxPerRun, 1, 2000, 200), minOrderValuePence: int(raw.minOrderValuePence, 0, 1_000_000_000, 0),
-                trustpilotDomain: str(raw.trustpilotDomain, 190), reviewUrlTemplate: str(raw.reviewUrlTemplate, 400), trustpilotApiKey: str(raw.trustpilotApiKey, 190),
-                trustpilotBusinessUnitId: str(raw.trustpilotBusinessUnitId, 64), businessName: str(raw.businessName, 190), replyTo: str(raw.replyTo, 190),
-                reviewMode: (['service', 'product', 'both'].includes(raw.reviewMode) ? raw.reviewMode : 'service'), productReviewUrlTemplate: str(raw.productReviewUrlTemplate, 400),
+                trustpilotDomain: page.trustpilotDomain, reviewUrlTemplate: page.reviewUrlTemplate, trustpilotApiKey: str(raw.trustpilotApiKey, 190).trim(),
+                trustpilotBusinessUnitId: str(raw.trustpilotBusinessUnitId, 64).replace(/[^A-Za-z0-9_-]/g, ''), businessName: str(raw.businessName, 190).trim(),
+                replyTo: /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/.test(str(raw.replyTo, 190).trim()) ? str(raw.replyTo, 190).trim() : '',
+                productReviewUrlTemplate: cleanUrl(str(raw.productReviewUrlTemplate, 400)),
+                reviewMode: (['service', 'product', 'both'].includes(raw.reviewMode) ? raw.reviewMode : 'service'),
             };
             await this.service.saveConfig(c); saved++;
         }
-        return res.json({ ok: true, saved, rejected });
+        const configs = await this.service.getAllConfigs(channelScope(ctx));
+        return res.json({
+            ok: true, saved, rejected, errors,
+            notReady: configs.map(c => ({ channelId: c.channelId, problem: reviewPageProblem(c) || null })),
+            configs,
+        });
     }
 
     // ── Admin: Trustpilot rating check (used by the settings tab) ───────
     @Post('trustpilot/check')
     async tpCheck(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: ReviewChannelConfig) {
         if (denyUnlessAdmin(ctx, res, false)) return;
+        if (denyUnlessPremium(res, 'The star-rating box')) return;
         // The form posts whatever key/domain is typed: probe live, never through the shared cache.
         const rating = await this.service.getRating(body as ReviewChannelConfig, { cache: false });
         return res.json({ ok: !!rating, rating, reviewUrl: buildReviewUrl(body.reviewUrlTemplate, body.trustpilotDomain) });
@@ -395,7 +513,11 @@ export class ReviewRequestController {
     @Post('trustpilot/detect')
     async tpDetect(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { trustpilotDomain: string; trustpilotApiKey: string; reviewUrlTemplate?: string }) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.detect(body.trustpilotDomain || '', body.trustpilotApiKey || '', body.reviewUrlTemplate));
+        // Building the review link is free; reading the live rating (the star-rating box) is premium.
+        const premium = ReviewRequestPlugin.hasPremiumAccess();
+        const r = await this.service.detect(String(body?.trustpilotDomain || ''), premium ? String(body?.trustpilotApiKey || '') : '', body?.reviewUrlTemplate);
+        if (!premium && body?.trustpilotApiKey) r.message = 'Review link ready. The star rating in the e-mail needs a licence (or an active evaluation).';
+        return res.json({ ...r, premium });
     }
 
     // ── Admin: stats + activity ────────────────────────────────────────
@@ -460,7 +582,7 @@ export class ReviewRequestController {
         const ch = scopedChannel(ctx, body?.channelId);
         if (!ch) return res.status(403).json({ error: 'forbidden' });
         const cfg = await this.service.getConfig(ch);
-        const rating = await this.service.getRating(cfg);
+        const rating = ReviewRequestPlugin.hasPremiumAccess() ? await this.service.getRating(cfg) : null;
         const businessName = cfg.businessName || cfg.trustpilotDomain || 'Your Store';
         const wantService = cfg.reviewMode === 'service' || cfg.reviewMode === 'both';
         const wantProduct = cfg.reviewMode === 'product' || cfg.reviewMode === 'both';
@@ -491,7 +613,9 @@ export class ReviewRequestController {
         const ch = scopedChannel(ctx, body.channelId, true);
         if (!ch) return res.status(403).json({ error: 'forbidden' });
         const cfg = await this.service.getConfig(ch);
-        const result = await this.service.sendInvitation(cfg, { id: 0, code: 'TEST-1234', email: body.email, firstName: 'there' });
+        const problem = reviewPageProblem(cfg);
+        if (problem) return res.status(400).json({ ok: false, reason: problem, code: 'not_set_up' });
+        const result = await this.service.sendInvitation(cfg, { id: 0, code: 'TEST-1234', email: String(body.email).trim().slice(0, 320), firstName: 'there' });
         return res.status(result.ok ? 200 : 500).json(result);
     }
 
@@ -516,7 +640,8 @@ export class ReviewRequestController {
     @Post('exclusions')
     async addExclusion(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { type: string; value: string; note?: string }) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        await this.service.addExclusion(body.type, body.value, body.note);
+        try { await this.service.addExclusion(String(body?.type || ''), String(body?.value || '').slice(0, 255), String(body?.note || '').slice(0, 255)); }
+        catch (e: any) { return res.status(400).json({ ok: false, message: 'Enter an e-mail address or a domain.' }); }
         return res.json({ ok: true });
     }
     @Delete('exclusions/:id')

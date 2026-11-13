@@ -360,7 +360,7 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
             const sendRes = await call(`send-order/${ch1Order}`, scopedToken, { method: 'POST', body: '{}' });
             expect([400, 402, 404]).toContain(sendRes.status);
             if (sendRes.status !== 402) expect((await sendRes.json()).reason).toBe('Order not found');
-            expect(await svc().sendForOrder(ch1Order, true, [ch2])).toEqual({ ok: false, reason: 'Order not found' }); // past the licence gate too
+            expect(await svc().sendForOrder(ch1Order, true, [ch2])).toMatchObject({ ok: false, reason: 'Order not found', code: 'not_found' }); // past the licence gate too
         });
 
         it('cannot change install-wide settings (licence, weekly report)', async () => {
@@ -378,4 +378,240 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
             expect((await (await call(`order-status/${ch1Order}`, superToken)).json()).found).toBe(true);
         });
     });
+
+    // ── 0.17.0: parity wave ────────────────────────────────────────────
+    describe('0.17.0 parity wave', () => {
+        let token = '';
+        const http = (path: string, init: RequestInit = {}) => fetch(`${BASE}/review-requests/${path}`, {
+            ...init, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(init.headers || {}) },
+        });
+        const setPremium = (on: boolean) => {
+            (ReviewRequestPlugin as any).licenceStatus = on ? { valid: true, message: 'e2e licence' } : { valid: false, message: 'No licence key configured.' };
+        };
+        const db = () => (svc() as any).db;
+        let base: any;
+
+        beforeAll(async () => {
+            await adminClient.asSuperAdmin();
+            token = adminClient.getAuthToken();
+            base = { ...(await svc().getConfig(1)), enabled: true, delayDays: 21, cooldownDays: 120, maxPerRun: 200, trustpilotDomain: 'elite-software.co.uk', reviewUrlTemplate: 'https://www.trustpilot.com/evaluate/{domain}' };
+            await svc().saveConfig(base);
+        });
+        afterEach(async () => { setPremium(false); await svc().saveConfig(base); });
+
+        it('B6: without a review page nothing is sent, logged or claimed — scheduled, manual, list or test', async () => {
+            await svc().saveConfig({ ...base, trustpilotDomain: '' });
+            const cust = await seedCustomer('nopage@example.com');
+            const order = await seedOrder(cust, [1]);
+            await withFakeSmtp(async sent => {
+                const run = await svc().runChannel(await svc().getConfig(1));
+                expect(run.notReady).toContain('Set your review page');
+                const r = await svc().sendForOrder(order);
+                expect(r).toMatchObject({ ok: false, code: 'not_set_up' });
+                setPremium(true);
+                const list = await svc().sendList(1, 'nopage2@example.com', 'now');
+                expect(list.ok).toBe(false);
+                expect(list.blocked).toContain('Set your review page');
+                const test = await http('test-send', { method: 'POST', body: JSON.stringify({ channelId: 1, email: 'me@example.com' }) });
+                expect(test.status).toBe(400);
+                expect(sent).toHaveLength(0);
+            });
+            expect(await db().query(`SELECT id FROM review_log WHERE orderId = ?`, [order])).toHaveLength(0);
+            expect(await db().query(`SELECT email FROM review_email_claim WHERE email = 'nopage@example.com'`)).toHaveLength(0);
+            expect(await db().query(`SELECT id FROM review_queue WHERE email = 'nopage2@example.com'`)).toHaveLength(0);
+            // Once the page is set the customer is invited normally (the cooldown did not hold them back).
+            await svc().saveConfig(base);
+            await withFakeSmtp(async sent => {
+                expect((await svc().sendForOrder(order)).ok).toBe(true);
+                expect(sent.map(m => m.to)).toEqual(['nopage@example.com']);
+            });
+        });
+
+        it('B6: the config save validates the review page and takes the identifier from a pasted page; Reviews.io uses company-reviews/store', async () => {
+            const save = async (patch: any) => (await http('config', { method: 'POST', body: JSON.stringify({ configs: [{ ...base, ...patch }] }) })).json();
+            let r = await save({ reviewUrlTemplate: 'https://www.trustpilot.com/evaluate/{domain}', trustpilotDomain: 'https://uk.trustpilot.com/review/harbourbakery.co.uk' });
+            expect(r.errors).toEqual([]);
+            expect((await svc().getConfig(1)).trustpilotDomain).toBe('harbourbakery.co.uk');
+            r = await save({ reviewUrlTemplate: 'https://search.google.com/local/writereview?placeid={domain}', trustpilotDomain: 'https://g.page/r/CabcdEFGH/review' });
+            expect(r.errors[0].message).toContain('Custom link');
+            expect((await svc().getConfig(1)).trustpilotDomain).toBe('');
+            expect(r.notReady.find((x: any) => x.channelId === 1).problem).toContain('Set your review page');
+            r = await save({ reviewUrlTemplate: 'https://www.reviews.io/company-review/store/{domain}/new', trustpilotDomain: 'https://www.reviews.io/company-reviews/store/harbour-bakery' });
+            const cfg = await svc().getConfig(1);
+            expect(cfg.reviewUrlTemplate).toBe('https://www.reviews.io/company-reviews/store/{domain}');
+            expect(cfg.trustpilotDomain).toBe('harbour-bakery');
+            r = await save({ reviewUrlTemplate: 'javascript:alert(1)', trustpilotDomain: '' });
+            expect(r.errors[0].message).toContain('is not a link');
+            expect((await svc().getConfig(1)).reviewUrlTemplate).toBe('https://www.reviews.io/company-reviews/store/{domain}');
+            // A Reviews.io template stored by an older version reads as the current one.
+            await db().query(`UPDATE review_config SET reviewUrlTemplate = 'https://www.reviews.io/company-review/store/{domain}/new' WHERE channelId = 1`);
+            expect((await svc().getConfig(1)).reviewUrlTemplate).toBe('https://www.reviews.io/company-reviews/store/{domain}');
+        });
+
+        it('manual send is free and adds an order note; Resend (force) needs a licence', async () => {
+            const order = await seedOrder(await seedCustomer('free-send@example.com', 'Fay'), [1]);
+            await withFakeSmtp(async sent => {
+                const r = await http(`send-order/${order}`, { method: 'POST', body: '{}' });
+                expect(r.status).toBe(200);
+                expect(sent.map(m => m.to)).toEqual(['free-send@example.com']);
+                const again = await http(`send-order/${order}`, { method: 'POST', body: JSON.stringify({ force: true }) });
+                expect(again.status).toBe(402);
+                setPremium(true);
+                expect((await http(`send-order/${order}`, { method: 'POST', body: JSON.stringify({ force: true }) })).status).toBe(200);
+                expect(sent).toHaveLength(2);
+            });
+            const notes: any[] = await db().query(`SELECT data FROM history_entry WHERE orderId = ? AND type = 'ORDER_NOTE'`, [order]);
+            expect(notes.length).toBe(2);
+            expect(String(notes[0].data)).toContain('Review invitation e-mailed to free-send@example.com');
+            const log: any[] = await db().query(`SELECT status, reason FROM review_log WHERE orderId = ? ORDER BY id`, [order]);
+            expect(log.map(l => `${l.status}:${l.reason}`)).toEqual(['sent:manual', 'sent:resend']);
+        });
+
+        it('manual send honours the cooldown and the hourly limit (Resend overrides the cooldown)', async () => {
+            const cust = await seedCustomer('cool@example.com');
+            const o1 = await seedOrder(cust, [1]);
+            const o2 = await seedOrder(cust, [1]);
+            await withFakeSmtp(async sent => {
+                expect((await svc().sendForOrder(o1)).ok).toBe(true);
+                const r = await svc().sendForOrder(o2);
+                expect(r).toMatchObject({ ok: false, code: 'cooldown' });
+                expect(await db().query(`SELECT id FROM review_log WHERE orderId = ? AND status = 'skipped' AND reason = 'cooldown'`, [o2])).toHaveLength(1);
+                expect((await svc().orderReviewStatus(o2)).cooldown).toBe(true);
+                expect((await svc().sendForOrder(o2, true)).ok).toBe(true);
+                expect(sent).toHaveLength(2);
+                // Hourly limit: with maxPerRun at what was already sent this hour, the next staff send waits.
+                const n = await svc().sentLastHour(1);
+                await svc().saveConfig({ ...base, maxPerRun: n });
+                const o3 = await seedOrder(await seedCustomer('capped@example.com'), [1]);
+                expect(await svc().sendForOrder(o3)).toMatchObject({ ok: false, code: 'capped' });
+            });
+        });
+
+        it('lists (premium): pasted text is parsed, sent a batch at a time; opt-outs, exclusions and the cooldown apply', async () => {
+            const body = 'Ana Lima <ana.list@example.com>, ben.list@example.com\nnot an address\nopted.list@example.com\nex.list@example.com';
+            const post = (mode: string, text: string) => http(`lists?channelId=1&mode=${mode}`, { method: 'POST', body: text, headers: { 'content-type': 'text/plain' } });
+            expect((await post('now', body)).status).toBe(402);
+            setPremium(true);
+            await svc().optOut('opted.list@example.com', await svc().optOutToken('opted.list@example.com'));
+            await svc().addExclusion('email', 'ex.list@example.com', 'e2e');
+            await withFakeSmtp(async sent => {
+                const r = await (await post('now', body)).json();
+                expect(r.ok).toBe(true);
+                expect(r.sent).toBe(2);
+                expect(r.skipped).toBe(2);
+                expect(r.invalid).toBe(1);
+                expect(r.message).toContain('could not be read');
+                expect(sent.map(m => m.to).sort()).toEqual(['ana.list@example.com', 'ben.list@example.com']);
+                const ana = sent.find(m => m.to === 'ana.list@example.com');
+                expect(ana.subject).toContain('Ana');
+                expect(ana.html).not.toContain('recent order'); // the built-in list e-mail mentions no order
+                const ben = sent.find(m => m.to === 'ben.list@example.com');
+                expect(ben.subject).toMatch(/^How did we do\? /); // no name known
+                const rows: any[] = await db().query(`SELECT email, state, reason FROM review_queue WHERE email LIKE '%.list@example.com' ORDER BY email`);
+                expect(rows.map(x => `${x.email}:${x.state}`)).toEqual([
+                    'ana.list@example.com:sent', 'ben.list@example.com:sent', 'ex.list@example.com:skipped', 'opted.list@example.com:skipped',
+                ]);
+                const logs: any[] = await db().query(`SELECT orderId, status, reason, queueId FROM review_log WHERE email = 'ana.list@example.com'`);
+                expect(logs).toHaveLength(1);
+                expect(logs[0]).toMatchObject({ orderId: 0, status: 'sent', reason: 'list' });
+                expect(Number(logs[0].queueId)).toBeGreaterThan(0);
+                // The cooldown: the same list again sends nobody.
+                const again = await (await post('now', 'ana.list@example.com')).json();
+                expect(again.sent).toBe(0);
+                expect(again.message).toContain('cooldown');
+            });
+        });
+
+        it('lists: more than 20 go out in the background; a scheduled list waits for its day and for sending to be on', async () => {
+            setPremium(true);
+            const many = Array.from({ length: 23 }, (_, i) => `bulk${i}.list@example.com`).join('\n');
+            await withFakeSmtp(async sent => {
+                const r = await svc().sendList(1, many, 'now');
+                expect(r.sent).toBe(20);
+                expect(r.queued).toBe(3);
+                const bg = await svc().processOutbox();
+                expect(bg.sent).toBe(3);
+                expect(sent).toHaveLength(23);
+
+                const sched = await svc().sendList(1, 'later1.list@example.com\nlater2.list@example.com', 'schedule');
+                expect(sched).toMatchObject({ ok: true, scheduled: 2, sent: 0 });
+                expect(sched.message).toContain('in 21 days');
+                expect(await svc().promoteScheduled()).toBe(0); // not due yet
+                const waiting = await svc().notInvited(null);
+                expect(waiting.scheduled.map((q: any) => q.email)).toEqual(expect.arrayContaining(['later1.list@example.com', 'later2.list@example.com']));
+                await db().query(`UPDATE review_queue SET dueAt = DATE_SUB(NOW(), INTERVAL 1 MINUTE) WHERE email = 'later1.list@example.com'`);
+                await svc().saveConfig({ ...base, enabled: false });
+                expect(await svc().promoteScheduled()).toBe(0); // sending off for the channel
+                await svc().saveConfig(base);
+                expect(await svc().promoteScheduled()).toBe(1);
+                await svc().processOutbox();
+                expect(sent.map(m => m.to)).toContain('later1.list@example.com');
+                expect(sent.map(m => m.to)).not.toContain('later2.list@example.com');
+                const q = waiting.scheduled.find((x: any) => x.email === 'later2.list@example.com');
+                expect((await (await http(`queue/${q.id}`, { method: 'DELETE' })).json()).ok).toBe(true);
+            });
+        });
+
+        it('the orders-list bulk action and Invite selected (premium): 20 now, the rest in the background', async () => {
+            const ids: number[] = [];
+            for (let i = 0; i < 22; i++) ids.push(await seedOrder(await seedCustomer(`bulk${i}.order@example.com`), [1]));
+            expect((await http('bulk-send', { method: 'POST', body: JSON.stringify({ orderIds: ids }) })).status).toBe(402);
+            setPremium(true);
+            const ni = await (await http('not-invited')).json();
+            expect(ni.orders.map((o: any) => o.orderId)).toEqual(expect.arrayContaining(ids));
+            await withFakeSmtp(async sent => {
+                const r = await (await http('bulk-send', { method: 'POST', body: JSON.stringify({ orderIds: ids.slice(0, 21) }) })).json();
+                expect(r).toMatchObject({ sent: 20, queued: 1, skipped: 0 });
+                expect(r.message).toContain('20 invitations sent');
+                const after = await svc().notInvited(null);
+                expect(after.outbox).toBe(1);
+                expect(after.orders.map((o: any) => o.orderId)).not.toContain(ids[20]); // waiting in the outbox
+                expect((await svc().processOutbox()).sent).toBe(1);
+                const inv = await (await http('invite-selected', { method: 'POST', body: JSON.stringify({ orderIds: [ids[21], ids[0]] }) })).json();
+                expect(inv.sent).toBe(1);
+                expect(inv.skipped).toBe(1); // ids[0] already invited
+                expect(sent).toHaveLength(22);
+            });
+            const notes: any[] = await db().query(`SELECT id FROM history_entry WHERE orderId = ? AND type = 'ORDER_NOTE'`, [ids[20]]);
+            expect(notes).toHaveLength(1);
+        });
+
+        it('opt-out list (free) and exclusions stay free', async () => {
+            await svc().optOut('listme.opt@example.com', await svc().optOutToken('listme.opt@example.com'));
+            const r = await (await http('optouts?q=listme.opt')).json();
+            expect(r.rows.map((x: any) => x.email)).toEqual(['listme.opt@example.com']);
+            expect(r.total).toBeGreaterThan(0);
+            expect([200, 201]).toContain((await http('exclusions', { method: 'POST', body: JSON.stringify({ type: 'email', value: 'free-ex@example.com' }) })).status);
+            expect((await http('exclusions', { method: 'POST', body: JSON.stringify({ type: 'email', value: '' }) })).status).toBe(400);
+        });
+
+        it('weekly report, set-up checklist and the rating box are premium', async () => {
+            const tick = vi_spy(svc().getDigest()!, 'tick');
+            expect(await svc().digestTick()).toBe(false);
+            expect(tick.calls).toBe(0);
+            expect(await (await http('setup')).json()).toMatchObject({ locked: true, items: [] });
+            expect((await http('digest/send-test', { method: 'POST', body: '{}' })).status).toBe(402);
+            expect((await http('digest/preview')).status).toBe(402);
+            expect((await (await http('digest/settings')).json()).premium).toBe(false);
+            expect((await http('trustpilot/check', { method: 'POST', body: JSON.stringify(base) })).status).toBe(402);
+            const rating = vi_spy(svc() as any, 'getRating');
+            await svc().composeEmail({ ...base, trustpilotApiKey: 'k' }, 'r@example.com', 'R', 'ORD1');
+            expect(rating.calls).toBe(0);
+            setPremium(true);
+            await svc().digestTick();
+            expect(tick.calls).toBe(1);
+            expect((await (await http('setup')).json()).locked).toBe(false);
+            await svc().composeEmail({ ...base, trustpilotApiKey: 'k' }, 'r@example.com', 'R', 'ORD1');
+            expect(rating.calls).toBe(1);
+            tick.restore(); rating.restore();
+        });
+    });
 });
+
+/** A minimal call-counting spy (jest's own spies are not imported in this file). */
+function vi_spy(obj: any, name: string): { calls: number; restore: () => void } {
+    const orig = obj[name];
+    const spy = { calls: 0, restore: () => { obj[name] = orig; } };
+    obj[name] = async (...args: any[]) => { spy.calls++; return name === 'getRating' ? null : orig.apply(obj, args); };
+    return spy;
+}

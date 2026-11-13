@@ -7,7 +7,8 @@ import { CustomDetailComponent, NotificationService, SharedModule } from '@vendu
 /**
  * Review-invitation panel on the admin order-detail page: shows whether
  * this order's customer has been invited to review, and lets staff send
- * (or force-resend) the invitation manually. Opt-outs are always
+ * the invitation manually (free: exclusions, the cooldown and the hourly
+ * limit apply) or force-resend it (Resend, premium). Opt-outs are always
  * honoured server-side. Colours adapt to the admin light/dark theme.
  */
 @Component({
@@ -28,19 +29,26 @@ import { CustomDetailComponent, NotificationService, SharedModule } from '@vendu
             <div class="rev-line" *ngIf="status.optedOut">
                 This customer unsubscribed from review emails — manual sending is disabled.
             </div>
-            <div class="rev-actions" *ngIf="!status.optedOut">
-                <button type="button" class="act-btn primary" *ngIf="!status.sent && !status.excluded" (click)="send(false)" [disabled]="sending">
+            <div class="rev-line" *ngIf="!status.optedOut && status.notReady">
+                Set your review page first (Marketing → Review Requests → Settings). Nothing is sent until then.
+            </div>
+            <div class="rev-line" *ngIf="!status.optedOut && !status.sent && !status.excluded && status.cooldown">
+                This customer was invited in the last {{ status.cooldownDays }} days (cooldown).
+            </div>
+            <div class="rev-actions" *ngIf="!status.optedOut && !status.notReady">
+                <button type="button" class="act-btn primary" *ngIf="!status.sent && !status.excluded && !status.cooldown" (click)="send(false)" [disabled]="sending">
                     {{ sending ? 'Sending…' : 'Send invitation now' }}
                 </button>
-                <ng-container *ngIf="!status.sent && status.excluded">
+                <span class="hint-inline" *ngIf="!status.premium && (status.sent || status.excluded || status.cooldown)">Resend needs a licence.</span>
+                <ng-container *ngIf="status.premium && !status.sent && (status.excluded || status.cooldown)">
                     <button type="button" class="act-btn" *ngIf="!confirmResend" (click)="confirmResend = true" [disabled]="sending">Send anyway…</button>
                     <ng-container *ngIf="confirmResend">
-                        <span class="confirm-note">This customer/domain is excluded — send regardless?</span>
+                        <span class="confirm-note">{{ status.excluded ? 'This customer/domain is excluded' : 'This customer is in the cooldown' }} — send regardless?</span>
                         <button type="button" class="act-btn primary" (click)="send(true)" [disabled]="sending">{{ sending ? 'Sending…' : 'Yes, send' }}</button>
                         <button type="button" class="act-btn" (click)="confirmResend = false" [disabled]="sending">Cancel</button>
                     </ng-container>
                 </ng-container>
-                <ng-container *ngIf="status.sent">
+                <ng-container *ngIf="status.sent && status.premium">
                     <button type="button" class="act-btn" *ngIf="!confirmResend" (click)="confirmResend = true" [disabled]="sending">Resend…</button>
                     <ng-container *ngIf="confirmResend">
                         <span class="confirm-note">Email the customer again?</span>
@@ -147,6 +155,7 @@ export class OrderReviewPanelComponent implements CustomDetailComponent, OnInit,
             error: e => {
                 this.sending = false;
                 this.notify.error(e?.error?.reason || e?.error?.message || 'Could not send the invitation');
+                this.load();
                 this.cdr.markForCheck();
             },
         });

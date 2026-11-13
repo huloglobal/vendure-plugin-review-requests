@@ -32,6 +32,8 @@ const SUBS = (dialect: 'postgres' | 'mysql'): Record<string, string | string[]> 
     'chScope': ['', ' AND id IN (?)'],
     'occScope': ['', ' AND `channelId` IN (?)'],
     'logScope': ['', ' AND channelId IN (?)'],
+    // 0.17.0 queue (lists, bulk sends, outbox) scoped like the log.
+    'qScope': ['', ' AND channelId IN (?)'],
     'custScope': ['', ' AND EXISTS (SELECT 1 FROM customer_channels_channel ccc WHERE ccc.`customerId` = customer.id AND ccc.`channelId` IN (?))'],
     'Math.min(take, 500)': '100',
 });
@@ -265,7 +267,8 @@ describe.skipIf(!TARGETS.length)(`SQL corpus (${PLUGIN})`, () => {
                 literals = listTsFiles(SRC)
                     .flatMap(f => extractTemplateLiterals(fs.readFileSync(f, 'utf8'), path.relative(SRC, f)))
                     .filter(l => SQL_RE.test(l.raw));
-                expect(literals.length).toBeGreaterThan(20);
+                // A literal the extractor cannot read past (a regex in a ${} expression) silently drops the rest of a file.
+                expect(literals.length).toBeGreaterThan(85);
 
                 statements = literals.flatMap(l => concrete(subs, l).map(sql => ({ ...l, sql })));
                 const isDdl = (s: string) => /^\s*(CREATE|ALTER|DROP)\b/i.test(s);

@@ -32,6 +32,8 @@ export class ReviewCrons {
         if (this.runInFlight) return;
         this.runInFlight = true;
         try {
+            // Scheduled list rows that are due join the outbox (sent by the per-minute run below).
+            await this.service.promoteScheduled().catch((e: any) => Logger.warn(`scheduled lists not promoted: ${e?.message || e}`, loggerCtx));
             const results = await this.service.runAll(false);
             const sent = results.reduce((n, r) => n + (r.sent || 0), 0);
             if (sent > 0) {
@@ -41,6 +43,31 @@ export class ReviewCrons {
             Logger.error(`review invitation run failed: ${e?.message || e}`, loggerCtx);
         } finally {
             this.runInFlight = false;
+        }
+    }
+
+    private outboxInFlight = false;
+
+    /** Staff sends to many customers (a list sent now, the orders-list bulk action, Invite
+     *  selected) go out in the background: SEND_BATCH a minute, within each channel's hourly
+     *  limit. Worker only; premium — after a lapse the outbox waits and resumes with a licence. */
+    @Cron(CronExpression.EVERY_MINUTE)
+    async sendOutbox() {
+        if (this.processContext.isServer) return;
+        if (getOptions().disableCron) return;
+        if (this.outboxInFlight) return;
+        this.outboxInFlight = true;
+        try {
+            if (!ReviewRequestPlugin.isLicensed()) {
+                try { const k = await this.service.loadStoredLicenceKey(); if (k) ReviewRequestPlugin.activateRuntimeLicence(k); } catch { /* store unavailable */ }
+            }
+            if (!ReviewRequestPlugin.hasPremiumAccess()) return;
+            const r = await this.service.processOutbox();
+            if (r.sent > 0) Logger.info(`Sent ${r.sent} queued review invitation(s); ${r.left} waiting`, loggerCtx);
+        } catch (e: any) {
+            Logger.error(`review outbox run failed: ${e?.message || e}`, loggerCtx);
+        } finally {
+            this.outboxInFlight = false;
         }
     }
 

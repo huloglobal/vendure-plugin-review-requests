@@ -12,7 +12,7 @@ interface ReviewConfig {
     businessName: string; replyTo: string; maxPerRun: number;
     reviewMode: 'service' | 'product' | 'both'; productReviewUrlTemplate: string;
 }
-type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
+type Tab = 'overview' | 'settings' | 'email' | 'customers' | 'exclusions' | 'activity';
 
 @Component({
     selector: 'ees-review-requests',
@@ -78,7 +78,7 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                         <strong>{{ meta.eval.daysRemaining }} day{{ meta.eval.daysRemaining === 1 ? '' : 's' }} left</strong> with everything enabled, scheduled sending included.
                     </ng-container>
                     <ng-template #evalNoClock>everything is enabled, scheduled sending included.</ng-template>
-                    Afterwards the plugin drops to the free tier (configure, preview + test-send).
+                    Afterwards the plugin drops to the free tier: configure, preview, test-send, exclusions and sending the invitation for one order from the order page.
                     <div class="banner-extra" *ngIf="meta.premiumFeatures?.length">Included now: {{ meta.premiumFeatures.join(' · ') }}</div>
                     <div class="banner-extra" *ngIf="meta.recentStats?.length"><strong>So far:</strong> {{ statsLine() }}</div>
                 </div>
@@ -95,7 +95,7 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                 </div>
             </div>
             <div class="update-banner major" *ngIf="meta.tier !== 'trial'">
-                <div><strong>🔓 Free tier</strong> — premium features need a licence. Subscribe below (monthly or annual, cancel any time) or buy a lifetime licence. Configure, preview and test-send stay active; scheduled sending needs a licence. Your setup is saved and reactivates instantly with a key.
+                <div><strong>🔓 Free tier</strong> — premium features need a licence. Subscribe below (monthly or annual, cancel any time) or buy a lifetime licence. Configure, preview, test-send, exclusions and sending the invitation for one order (Review invitation panel on the order page) stay free; scheduled sending, lists, bulk sends, Resend, the star rating and the weekly report need a licence. Your setup is saved and reactivates instantly with a key.
                     <div class="banner-extra" *ngIf="meta.premiumFeatures?.length">With a licence: {{ meta.premiumFeatures.join(' · ') }}</div>
                     <div class="banner-extra" *ngIf="meta.recentStats?.length"><strong>{{ meta.eval?.source === 'server' ? 'During your evaluation:' : 'So far:' }}</strong> {{ statsLine() }}</div>
                 </div>
@@ -132,11 +132,22 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                         <button class="tab" role="tab" [class.active]="tab==='overview'" (click)="go('overview')">Overview</button>
                         <button class="tab" role="tab" [class.active]="tab==='settings'" (click)="go('settings')">Settings</button>
                         <button class="tab" role="tab" [class.active]="tab==='email'" (click)="go('email')">Email</button>
+                        <button class="tab" role="tab" [class.active]="tab==='customers'" (click)="go('customers')">Customers<span class="tab-count" *ngIf="notInvited?.orders?.length">{{ notInvited.orders.length }}</span></button>
                         <button class="tab" role="tab" [class.active]="tab==='exclusions'" (click)="go('exclusions')">Exclusions<span class="tab-count" *ngIf="exclusions.length">{{ exclusions.length }}</span></button>
                         <button class="tab" role="tab" [class.active]="tab==='activity'" (click)="go('activity')">Activity</button>
                     </div>
                 </div>
             </div>
+        </vdr-page-block>
+
+        <vdr-page-block *ngIf="!loading && current && reviewPageProblem()">
+            <div class="notice-strip warn-strip">
+                <strong>Nothing is sent yet:</strong> {{ reviewPageProblem() }}
+                <a class="hint-link" *ngIf="tab !== 'settings'" (click)="go('settings')">Open Settings</a>
+            </div>
+        </vdr-page-block>
+        <vdr-page-block *ngIf="saveErrors.length">
+            <div class="notice-strip warn-strip"><div *ngFor="let e of saveErrors">{{ e }}</div></div>
         </vdr-page-block>
 
         <!-- OVERVIEW -->
@@ -195,7 +206,7 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
         <ng-container *ngIf="!loading && current && tab==='settings'">
             <vdr-page-block><div class="card"><div class="card-block">
                 <h3 class="step-title">Where should reviews go?</h3>
-                <p class="hint">Pick a platform and we build the review link. Trustpilot can also show your live star rating in the email (free API key). Google &amp; Reviews.io use the link only.</p>
+                <p class="hint">Pick a platform and we build the review link. Paste your review page if you like: we take the domain, Place ID or store ID from it. Trustpilot and Google can also show your live star rating in the email (free API key; the rating box needs a licence). Reviews.io and custom links use the link only. Until the review page is set, nothing is sent.</p>
                 <div class="form-grid">
                     <div class="form-row"><label>Review platform</label>
                         <select class="form-input" [(ngModel)]="platform" (ngModelChange)="onPlatform()">
@@ -207,7 +218,7 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                     <div class="form-row"><label>{{ platformLabel() }}</label>
                         <input class="form-input" [(ngModel)]="current.trustpilotDomain" (ngModelChange)="markDirty()" [placeholder]="platformPlaceholder()">
                         <div class="hint" style="margin-top:4px">{{ platformHelp() }}</div></div>
-                    <div class="form-row" *ngIf="platform==='trustpilot' || platform==='google'"><label>{{ keyLabel() }} <small>(optional — for the star rating)</small></label>
+                    <div class="form-row" *ngIf="platform==='trustpilot' || platform==='google'"><label>{{ keyLabel() }} <small>(optional — for the star rating{{ meta && !meta.premium ? ', which needs a licence' : '' }})</small></label>
                         <input class="form-input mono" [(ngModel)]="current.trustpilotApiKey" (ngModelChange)="markDirty()" placeholder="paste key or leave blank">
                         <div class="hint" style="margin-top:4px"><a [href]="keyLink()" target="_blank">{{ keyLinkText() }} &#8594;</a></div></div>
                 </div>
@@ -250,12 +261,13 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                     </span>
                 </div>
                 <p class="hint">Every Monday at 08:00 (server time) one email sums up last week — invitations sent, review links clicked, opt-outs, failures — with the next set-up step while the checklist is incomplete. It goes through the same SMTP as the invitations.</p>
+                <p class="hint" *ngIf="digest && digest.premium === false"><strong>The weekly report needs a licence (or the 14-day evaluation).</strong> Your settings are kept; it starts again as soon as a licence is active.</p>
                 <ng-container *ngIf="digest; else digestLoading">
                     <div class="picker">
                         <input class="form-input" style="min-width:280px" type="email" [(ngModel)]="digestRecipient" [placeholder]="digest.defaultRecipient ? 'Defaults to ' + digest.defaultRecipient : 'you@yourstore.com'">
                         <button class="gbtn gbtn-primary gbtn-sm" (click)="saveDigestRecipient()" [disabled]="digestSaving">{{ digestSaving ? 'Saving…' : 'Save recipient' }}</button>
-                        <button class="gbtn gbtn-outline gbtn-sm" (click)="sendDigestTest()" [disabled]="digestSending">{{ digestSending ? 'Sending…' : 'Send me a test' }}</button>
-                        <button class="gbtn gbtn-outline gbtn-sm" (click)="previewDigest()" [disabled]="digestPreviewing">{{ digestPreviewing ? 'Building…' : 'Preview' }}</button>
+                        <button class="gbtn gbtn-outline gbtn-sm" (click)="sendDigestTest()" [disabled]="digestSending || digest.premium === false">{{ digestSending ? 'Sending…' : 'Send me a test' }}</button>
+                        <button class="gbtn gbtn-outline gbtn-sm" (click)="previewDigest()" [disabled]="digestPreviewing || digest.premium === false">{{ digestPreviewing ? 'Building…' : 'Preview' }}</button>
                     </div>
                     <p class="hint">Last sent {{ digest.lastSentAt ? (digest.lastSentAt | date:'d MMM y, HH:mm') : 'never' }} · next {{ digest.nextDueAt ? (digest.nextDueAt | date:'d MMM y, HH:mm') : '—' }}<span *ngIf="digest.enabled && !digest.recipient && !digest.defaultRecipient"> · <strong>no recipient yet</strong> — enter one above or set a reply-to for the channel</span></p>
                 </ng-container>
@@ -275,7 +287,7 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                         <input class="form-input" type="number" min="0" [ngModel]="current.minOrderValuePence/100" (ngModelChange)="current.minOrderValuePence=$event*100; markDirty()"></div>
                     <div class="form-row"><label>Don't re-ask within <small>(days)</small></label>
                         <input class="form-input" type="number" min="0" [(ngModel)]="current.cooldownDays" (ngModelChange)="markDirty()"></div>
-                    <div class="form-row"><label>Max per hourly run</label>
+                    <div class="form-row"><label>Most invitations per hour <small>(scheduled and staff sends together)</small></label>
                         <input class="form-input" type="number" min="1" [(ngModel)]="current.maxPerRun" (ngModelChange)="markDirty()"></div>
                     <div class="form-row"><label>Reply-to <small>(optional)</small></label>
                         <input class="form-input" [(ngModel)]="current.replyTo" (ngModelChange)="markDirty()" placeholder="hello@yourstore.com"></div>
@@ -404,6 +416,91 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
                 </table>
                 <p class="hint" *ngIf="!exclusions.length">No exclusions yet.</p>
             </div></div></vdr-page-block>
+            <vdr-page-block><div class="card"><div class="card-block">
+                <div class="row-between"><h3 class="step-title" style="margin:0">Unsubscribed <small>({{ optOuts?.total || 0 }})</small></h3>
+                    <input class="form-input" style="min-width:240px" placeholder="Search by e-mail…" [(ngModel)]="optOutQuery" (ngModelChange)="onOptOutSearch()"></div>
+                <p class="hint">These customers used the unsubscribe link in an invitation. They are never invited again, not even by a manual send or Resend.</p>
+                <table class="table" *ngIf="optOuts?.rows?.length; else noOptOuts">
+                    <thead><tr><th>E-mail</th><th>Unsubscribed</th></tr></thead>
+                    <tbody><tr *ngFor="let o of optOuts.rows"><td class="mono">{{ o.email }}</td><td class="hint">{{ o.createdAt | date:'d MMM y' }}</td></tr></tbody>
+                </table>
+                <ng-template #noOptOuts><p class="hint">{{ optOutQuery ? 'Nobody matches “' + optOutQuery + '”.' : 'Nobody yet.' }}</p></ng-template>
+                <h4 class="subsection-title">Check an address</h4>
+                <div class="picker">
+                    <input class="form-input" style="min-width:260px" type="email" placeholder="name@example.com" [(ngModel)]="checkEmail" (keyup.enter)="checkAddress()">
+                    <button class="gbtn gbtn-outline gbtn-sm" (click)="checkAddress()" [disabled]="!checkEmail">Check</button>
+                    <span class="hint inline" *ngIf="checkResult">{{ checkResult }}</span>
+                </div>
+            </div></div></vdr-page-block>
+        </ng-container>
+
+        <!-- CUSTOMERS (lists, Not invited yet: premium) -->
+        <ng-container *ngIf="!loading && current && tab==='customers'">
+            <vdr-page-block *ngIf="meta && !meta.premium"><div class="card"><div class="card-block">
+                <h3 class="step-title">Invite customers from a list or from recent orders</h3>
+                <p class="hint">Paste or upload a list of customers and invite them now or on a schedule, see every recent order whose customer has not been invited yet and invite a selection in one go, or use <strong>Send review invitation</strong> on the Orders list. These need a licence or the 14-day evaluation — activate one at the top of this page. Sending the invitation for one order (the Review invitation panel on the order page) stays free.</p>
+            </div></div></vdr-page-block>
+            <ng-container *ngIf="meta?.premium">
+                <vdr-page-block><div class="card"><div class="card-block">
+                    <h3 class="step-title">Invite customers from a list <small>({{ current.channelCode }})</small></h3>
+                    <p class="hint">Paste one customer per line ("Name, e-mail", "Name &lt;e-mail&gt;" or just the e-mail; addresses copied from an e-mail's To: field work too), or choose a CSV file (up to 1 MB) with a name and an e-mail column. Opt-outs, exclusions, the cooldown and the hourly limit apply.</p>
+                    <textarea class="rte-source list-box" rows="7" [(ngModel)]="listText" spellcheck="false" placeholder="Jo Bloggs, jo@example.com&#10;sam@example.com"></textarea>
+                    <div class="picker" style="margin-top:8px">
+                        <label class="hint inline">or a CSV file <input type="file" accept=".csv,text/csv,text/plain" (change)="onListFile($event)"></label>
+                        <span class="hint inline" *ngIf="listFileName">{{ listFileName }}</span>
+                    </div>
+                    <div class="list-modes">
+                        <label><input type="radio" name="rrListMode" value="now" [(ngModel)]="listMode"> Send now — the first 20 straight away, the rest in the background within your hourly limit</label>
+                        <label><input type="radio" name="rrListMode" value="schedule" [(ngModel)]="listMode"> Schedule — invite each customer {{ current.delayDays }} day{{ current.delayDays === 1 ? '' : 's' }} from now<span *ngIf="!current.enabled"> (sending is off for this channel: nothing goes out until you switch it on)</span></label>
+                    </div>
+                    <div class="picker">
+                        <button class="gbtn gbtn-primary gbtn-sm" (click)="sendList()" [disabled]="listSending || (!listText.trim() && !listFileText) || !!reviewPageProblem()">{{ listSending ? 'Working…' : (listMode === 'schedule' ? 'Schedule invitations' : 'Send review invitations') }}</button>
+                        <span class="hint inline" *ngIf="listResult">{{ listResult }}</span>
+                    </div>
+                </div></div></vdr-page-block>
+
+                <vdr-page-block><div class="card"><div class="card-block">
+                    <div class="row-between">
+                        <h3 class="step-title" style="margin:0">Not invited yet <small>({{ notInvited?.orders?.length || 0 }}{{ (notInvited?.orders?.length || 0) >= 100 ? '+' : '' }})</small></h3>
+                        <button class="gbtn gbtn-outline gbtn-sm" (click)="loadNotInvited()" [disabled]="notInvitedLoading">{{ notInvitedLoading ? 'Loading…' : 'Refresh' }}</button>
+                    </div>
+                    <p class="hint">Recent orders at or beyond each channel's trigger state whose customer has had no invitation for them, including orders not due yet. Customers who unsubscribed are left out.</p>
+                    <p class="hint" *ngIf="notInvited?.outbox"><strong>{{ notInvited.outbox }}</strong> invitation{{ notInvited.outbox === 1 ? ' is' : 's are' }} going out in the background.</p>
+                    <p class="hint" *ngIf="notInvited?.failed">{{ notInvited.failed }} list invitation{{ notInvited.failed === 1 ? '' : 's' }} failed to send this week — see the Activity tab.</p>
+                    <table class="table" *ngIf="notInvited?.orders?.length; else nobodyWaiting">
+                        <thead><tr>
+                            <th style="width:28px"><input type="checkbox" [checked]="allOrdersSelected()" (change)="toggleAllOrders($any($event.target).checked)" aria-label="Select all"></th>
+                            <th>Order</th><th>Customer</th><th>Placed</th><th>Channel</th><th></th>
+                        </tr></thead>
+                        <tbody><tr *ngFor="let o of notInvited.orders">
+                            <td><input type="checkbox" [checked]="selOrders.has(o.orderId)" (change)="toggleOrder(o.orderId)" [attr.aria-label]="'Select ' + o.code"></td>
+                            <td><strong>{{ o.code }}</strong> <span class="hint">{{ o.state }}</span></td>
+                            <td>{{ o.name }} <span class="hint mono">{{ o.email }}</span></td>
+                            <td class="hint">{{ o.placedAt | date:'d MMM y' }}</td>
+                            <td class="hint">{{ o.channelCode }}</td>
+                            <td><span class="pill st-skipped" *ngIf="o.flag">{{ o.flag === 'cooldown' ? 'in cooldown' : 'excluded' }}</span></td>
+                        </tr></tbody>
+                    </table>
+                    <ng-template #nobodyWaiting><p class="hint">{{ notInvitedLoading ? 'Loading…' : 'Nobody is waiting.' }}</p></ng-template>
+
+                    <ng-container *ngIf="notInvited?.scheduled?.length">
+                        <h4 class="subsection-title">Scheduled from lists</h4>
+                        <table class="table">
+                            <thead><tr><th style="width:28px"></th><th>Customer</th><th>Goes out</th><th></th></tr></thead>
+                            <tbody><tr *ngFor="let q of notInvited.scheduled">
+                                <td><input type="checkbox" [checked]="selQueue.has(q.id)" (change)="toggleQueue(q.id)" [attr.aria-label]="'Select ' + q.email"></td>
+                                <td>{{ q.name }} <span class="hint mono">{{ q.email }}</span></td>
+                                <td class="hint">{{ q.dueAt | date:'d MMM y HH:mm' }}</td>
+                                <td class="num-col"><button class="chip-x" (click)="cancelQueued(q)" [attr.aria-label]="'Remove ' + q.email">×</button></td>
+                            </tr></tbody>
+                        </table>
+                    </ng-container>
+                    <div class="picker" style="margin-top:10px" *ngIf="notInvited?.orders?.length || notInvited?.scheduled?.length">
+                        <button class="gbtn gbtn-primary gbtn-sm" (click)="inviteSelected()" [disabled]="inviting || !(selOrders.size + selQueue.size) || !!reviewPageProblem()">{{ inviting ? 'Sending…' : 'Invite selected (' + (selOrders.size + selQueue.size) + ')' }}</button>
+                        <span class="hint inline">Opt-outs, exclusions, the cooldown and the hourly limit apply; the first 20 go out now, the rest in the background.</span>
+                    </div>
+                </div></div></vdr-page-block>
+            </ng-container>
         </ng-container>
 
         <!-- ACTIVITY -->
@@ -570,6 +667,10 @@ type Tab = 'overview' | 'settings' | 'email' | 'exclusions' | 'activity';
         .eval-actions { align-items:center; }
         .eval-email { padding:5px 9px; border:1px solid var(--gb-ui-border); border-radius:7px; font-size:12.5px; min-width:190px; background:#fff; color:#0f172a; }
         .eval-ok { font-size:12.5px; color:var(--gb-strong); font-weight:600; }
+        .warn-strip a { margin-left:8px; }
+        .list-box { border:1px solid var(--gb-ui-border); border-radius:8px; }
+        .list-modes { display:flex; flex-direction:column; gap:6px; margin:6px 0 12px; font-size:13px; }
+        .list-modes label { display:flex; gap:8px; align-items:flex-start; }
     `],
 })
 export class ReviewRequestsComponent implements OnInit {
@@ -673,7 +774,16 @@ export class ReviewRequestsComponent implements OnInit {
     running = false; checking = false; checkMsg = '';
     advancedOpen = false; connecting = false; connectMsg = ''; connectOk = false;
     platform = 'trustpilot';
-    platformTemplates: any = { trustpilot: 'https://www.trustpilot.com/evaluate/{domain}', google: 'https://search.google.com/local/writereview?placeid={domain}', reviewsio: 'https://www.reviews.io/company-review/store/{domain}/new' };
+    platformTemplates: any = { trustpilot: 'https://www.trustpilot.com/evaluate/{domain}', google: 'https://search.google.com/local/writereview?placeid={domain}', reviewsio: 'https://www.reviews.io/company-reviews/store/{domain}' };
+    saveErrors: string[] = [];
+    // Customers tab (premium)
+    listText = ''; listFileText = ''; listFileName = ''; listMode: 'now' | 'schedule' = 'now'; listSending = false; listResult = '';
+    notInvited: any = null; notInvitedLoading = false; inviting = false;
+    selOrders = new Set<number>(); selQueue = new Set<number>();
+    // Exclusions tab: unsubscribed list (free)
+    optOuts: { rows: Array<{ email: string; createdAt: string }>; total: number } | null = null;
+    optOutQuery = ''; private optOutTimer: any;
+    checkEmail = ''; checkResult = '';
 
     constructor(private http: HttpClient, private notify: NotificationService, private cdr: ChangeDetectorRef, private sanitizer: DomSanitizer, private modalService: ModalService) {}
 
@@ -736,7 +846,7 @@ export class ReviewRequestsComponent implements OnInit {
     }
 
     // ── Weekly report (Settings) ──────────────────────────────────────
-    digest: { enabled: boolean; recipient: string | null; defaultRecipient: string | null; lastSentAt: string | null; nextDueAt: string | null } | null = null;
+    digest: { enabled: boolean; recipient: string | null; defaultRecipient: string | null; lastSentAt: string | null; nextDueAt: string | null; premium?: boolean } | null = null;
     digestRecipient = '';
     digestError = '';
     digestSaving = false; digestSending = false; digestPreviewing = false;
@@ -823,7 +933,7 @@ export class ReviewRequestsComponent implements OnInit {
     private startClaimPoll() { this.stopClaimPoll(); this.claimTimer = setInterval(() => this.checkClaim(false), 15000); }
     private stopClaimPoll() { if (this.claimTimer) { clearInterval(this.claimTimer); this.claimTimer = null; } }
     private restartTimer: any = null;
-    ngOnDestroy() { this.stopClaimPoll(); clearTimeout(this.custTimer); clearTimeout(this.restartTimer); }
+    ngOnDestroy() { this.stopClaimPoll(); clearTimeout(this.custTimer); clearTimeout(this.restartTimer); clearTimeout(this.optOutTimer); }
 
     portalOpening = false;
     licenceLabel(): string {
@@ -877,7 +987,7 @@ export class ReviewRequestsComponent implements OnInit {
     derivePlatform() {
         const t = this.current?.reviewUrlTemplate || '';
         if (t.includes('trustpilot.com')) this.platform = 'trustpilot';
-        else if (t.includes('google.com')) this.platform = 'google';
+        else if (t.startsWith('https://search.google.com/local/writereview')) this.platform = 'google';
         else if (t.includes('reviews.io')) this.platform = 'reviewsio';
         else this.platform = 'custom';
     }
@@ -904,16 +1014,17 @@ export class ReviewRequestsComponent implements OnInit {
     keyLinkText(): string { return this.platform === 'google' ? 'Enable the Places API' : 'Get a free key'; }
     platformHelp(): string {
         return this.platform === 'google' ? 'Find your Place ID at developers.google.com/maps/documentation/places/web-service/place-id. Add a Google Maps API key (Places API) below and we pull your live Google star rating too.'
-            : this.platform === 'reviewsio' ? 'Your Reviews.io store ID from your Reviews.io dashboard.'
-            : this.platform === 'custom' ? 'Edit the full link template under Advanced settings.'
-            : 'Your domain exactly as it appears on Trustpilot.';
+            : this.platform === 'reviewsio' ? 'Your Reviews.io store ID — the last part of your Reviews.io page (reviews.io/company-reviews/store/your-store). Pasting the page works too.'
+            : this.platform === 'custom' ? 'Edit the full link template under Advanced settings (it must start with https://). Leave this empty if the link has no {domain}.'
+            : 'Your domain exactly as it appears on Trustpilot, or paste your Trustpilot page (trustpilot.com/review/yourstore.com).';
     }
     go(t: Tab) { this.tab = t; this.loadForTab(t); }
     private loadForTab(t: Tab) {
         if (t === 'overview') { this.loadSetup(); this.loadStats(); this.loadLog(); }
         if (t === 'settings') this.loadDigest();
         if (t === 'email') this.loadTemplate();
-        if (t === 'exclusions') { this.loadExclusions(); this.loadStats(); }
+        if (t === 'exclusions') { this.loadExclusions(); this.loadStats(); this.loadOptOuts(); }
+        if (t === 'customers' && this.meta?.premium) this.loadNotInvited();
         if (t === 'activity') this.loadLog();
     }
 
@@ -922,14 +1033,108 @@ export class ReviewRequestsComponent implements OnInit {
         const c = this.current; if (!c) return '';
         if (!c.enabled) return 'Review requests are OFF for this channel — nothing is sent.';
         const val = c.minOrderValuePence ? ` over £${(c.minOrderValuePence/100).toFixed(0)}` : '';
-        const tp = c.trustpilotDomain ? `your Trustpilot page for ${c.trustpilotDomain}` : '(set your Trustpilot domain in Settings)';
-        return `${c.delayDays} days after an order${val} reaches ${c.triggerState}, the customer is invited to review ${tp} — at most once every ${c.cooldownDays} days.`;
+        if (this.reviewPageProblem()) return 'Sending is on, but nothing goes out until the review page is set (Settings).';
+        const where = this.platform === 'trustpilot' ? `your Trustpilot page for ${c.trustpilotDomain}`
+            : this.platform === 'google' ? 'your Google business profile'
+            : this.platform === 'reviewsio' ? `your Reviews.io page (${c.trustpilotDomain})` : 'your review page';
+        const auto = this.meta && !this.meta.premium ? ' Scheduled sending needs a licence; until then send from the order page.' : '';
+        return `${c.delayDays} days after an order${val} reaches ${c.triggerState}, the customer is invited to review ${where} — at most once every ${c.cooldownDays} days.${auto}`;
+    }
+    /** Same rule as the server: no link, or a link that needs an identifier and has none. */
+    reviewPageProblem(): string {
+        const c = this.current; if (!c) return '';
+        const t = (c.reviewUrlTemplate || '').trim();
+        return !t || (!(c.trustpilotDomain || '').trim() && t.includes('{domain}'))
+            ? 'set your review page (Settings → Where should reviews go?). Until then no invitation is sent, so customers are not held back by the cooldown.' : '';
     }
     save() {
         if (!this.current) return; this.saving = true;
-        this.http.post('/review-requests/config', { configs: [this.current] }).subscribe({
-            next: () => { this.saving = false; this.dirty = false; this.notify.success('Settings saved'); this.cdr.markForCheck(); },
+        const id = this.current.channelId;
+        this.http.post<any>('/review-requests/config', { configs: [this.current] }).subscribe({
+            next: r => {
+                this.saving = false; this.dirty = false;
+                this.saveErrors = (r?.errors || []).filter((e: any) => Number(e.channelId) === Number(id)).map((e: any) => e.message);
+                // The server normalises the review page (identifier taken from a pasted page, a wrong one not kept).
+                const fresh = (r?.configs || []).find((c: any) => Number(c.channelId) === Number(id));
+                if (fresh) { this.configs[this.currentIdx] = fresh; this.derivePlatform(); }
+                if (this.saveErrors.length) this.notify.warning('Settings saved — check the review page');
+                else this.notify.success('Settings saved');
+                this.cdr.markForCheck();
+            },
             error: () => { this.saving = false; this.notify.error('Save failed'); },
+        });
+    }
+
+    // ── Customers tab (premium) ───────────────────────────────────────
+    onListFile(ev: Event) {
+        const input = ev.target as HTMLInputElement;
+        const f = input.files?.[0];
+        this.listFileText = ''; this.listFileName = '';
+        if (!f) return;
+        if (f.size > 1_048_576) { this.notify.error('The file is larger than 1 MB. Split it into smaller lists.'); input.value = ''; return; }
+        const reader = new FileReader();
+        reader.onload = () => { this.listFileText = String(reader.result || ''); this.listFileName = f.name; this.cdr.markForCheck(); };
+        reader.onerror = () => { this.notify.error('The file could not be read.'); };
+        reader.readAsText(f);
+    }
+    sendList() {
+        if (!this.current) return;
+        const text = [this.listText, this.listFileText].filter(t => t && t.trim()).join('\n');
+        if (!text.trim()) return;
+        this.listSending = true; this.listResult = '';
+        this.http.post<any>(`/review-requests/lists?channelId=${this.current.channelId}&mode=${this.listMode}`, text, { headers: { 'content-type': 'text/plain; charset=utf-8' } }).subscribe({
+            next: r => {
+                this.listSending = false; this.listResult = r?.message || 'Done';
+                this.listText = ''; this.listFileText = ''; this.listFileName = '';
+                this.notify.success(this.listMode === 'schedule' ? 'List scheduled' : 'List sent');
+                this.loadNotInvited(); this.cdr.markForCheck();
+            },
+            error: e => { this.listSending = false; this.listResult = e?.error?.message || ''; this.notify.error(this.errMsg(e, 'Inviting from a list')); this.cdr.markForCheck(); },
+        });
+    }
+    loadNotInvited() {
+        this.notInvitedLoading = true;
+        this.http.get<any>('/review-requests/not-invited').subscribe({
+            next: r => {
+                this.notInvitedLoading = false; this.notInvited = r;
+                const ids = new Set((r?.orders || []).map((o: any) => o.orderId));
+                this.selOrders = new Set([...this.selOrders].filter(id => ids.has(id)));
+                const q = new Set((r?.scheduled || []).map((o: any) => o.id));
+                this.selQueue = new Set([...this.selQueue].filter(id => q.has(id)));
+                this.cdr.markForCheck();
+            },
+            error: () => { this.notInvitedLoading = false; this.cdr.markForCheck(); },
+        });
+    }
+    toggleOrder(id: number) { this.selOrders.has(id) ? this.selOrders.delete(id) : this.selOrders.add(id); }
+    toggleQueue(id: number) { this.selQueue.has(id) ? this.selQueue.delete(id) : this.selQueue.add(id); }
+    allOrdersSelected(): boolean { const o = this.notInvited?.orders || []; return o.length > 0 && o.every((x: any) => this.selOrders.has(x.orderId)); }
+    toggleAllOrders(on: boolean) { this.selOrders = new Set(on ? (this.notInvited?.orders || []).map((x: any) => x.orderId) : []); }
+    inviteSelected() {
+        this.inviting = true;
+        this.http.post<any>('/review-requests/invite-selected', { orderIds: [...this.selOrders], queueIds: [...this.selQueue] }).subscribe({
+            next: r => { this.inviting = false; this.selOrders.clear(); this.selQueue.clear(); this.notify.success(r?.message || 'Done'); this.loadNotInvited(); this.loadLog(); },
+            error: e => { this.inviting = false; this.notify.error(this.errMsg(e, 'Invite selected')); this.cdr.markForCheck(); },
+        });
+    }
+    cancelQueued(q: any) {
+        this.http.delete<any>(`/review-requests/queue/${q.id}`).subscribe({
+            next: () => { this.notify.success(`Removed ${q.email}`); this.loadNotInvited(); },
+            error: () => this.notify.error('Could not remove it'),
+        });
+    }
+
+    // ── Unsubscribed list (Exclusions tab) ────────────────────────────
+    loadOptOuts() {
+        const q = this.optOutQuery.trim();
+        this.http.get<any>(`/review-requests/optouts${q ? '?q=' + encodeURIComponent(q) : ''}`).subscribe({ next: r => { this.optOuts = r; this.cdr.markForCheck(); }, error: () => undefined });
+    }
+    onOptOutSearch() { clearTimeout(this.optOutTimer); this.optOutTimer = setTimeout(() => this.loadOptOuts(), 250); }
+    checkAddress() {
+        const e = this.checkEmail.trim(); if (!e) return;
+        this.http.get<any>(`/review-requests/exclusions/check?email=${encodeURIComponent(e)}`).subscribe({
+            next: r => { this.checkResult = r?.excluded ? `Never invited (${r.via}).` : 'Not excluded — can be invited.'; this.cdr.markForCheck(); },
+            error: () => { this.checkResult = 'Check failed'; this.cdr.markForCheck(); },
         });
     }
 

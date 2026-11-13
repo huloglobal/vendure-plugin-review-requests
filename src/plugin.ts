@@ -27,9 +27,11 @@ UwIDAQAB
 const REVOCATION_URL = process.env.HULO_LICENCE_REVOCATION_URL || 'https://elite.charity/licence/revoked.json';
 
 export interface ReviewPluginInitOptions extends ReviewPluginOptions {
-    /** JWT licence from huloglobal.com. Without it the plugin runs in the
-     *  FREE tier: configure + preview + test-send only — scheduled sending
-     *  requires a licence. */
+    /** JWT licence from huloglobal.com. Without it (and once the 14-day
+     *  evaluation ends) the plugin runs in the FREE tier: configure, preview,
+     *  test-send, exclusions and sending the invitation for one order from the
+     *  order page. Scheduled sending, lists, bulk sends, Resend, the rating box
+     *  and the weekly report need a licence (see PREMIUM_FEATURES). */
     licenceKey?: string;
 }
 
@@ -134,6 +136,7 @@ export class ReviewRequestPlugin {
             licence: () => describeLicence(ReviewRequestPlugin.licenceStatus),
             evalState: () => ReviewRequestPlugin.getEvalState(),
             refresh: () => this.restoreStoredLicence(),
+            premium: () => ReviewRequestPlugin.hasPremiumAccess(),
         });
     }
 
@@ -174,16 +177,15 @@ export class ReviewRequestPlugin {
         });
         ReviewRequestPlugin.activeKey = ReviewRequestPlugin.licenceStatus.valid ? (options.licenceKey || null) : null;
         if (!ReviewRequestPlugin.licenceStatus.valid) {
-            // Unlicensed: register the install (no premium is granted by this; the 14-day
-            // evaluation. All premium paths stay enabled while it runs;
-            // when it ends the plugin drops to the free tier (configure,
-            // preview + test-send only).
+            // Unlicensed: register the install for the 14-day evaluation (no card). All
+            // premium paths stay enabled while it runs; when it ends the plugin drops to the
+            // free tier (configure, preview, test-send, exclusions, one-order sends).
             if (!ReviewRequestPlugin.evalClient) {
                 ReviewRequestPlugin.evalClient = new EvaluationClient({ packageName: PKG_NAME, packageVersion: PKG_VERSION });
                 ReviewRequestPlugin.evalClient.start();
             }
             // eslint-disable-next-line no-console
-            console.warn(`[${PKG_NAME}] ${ReviewRequestPlugin.licenceStatus.message} — running in the FREE tier — start the 14-day free trial (card required, nothing charged until day 15) from the plugin's admin page`);
+            console.warn(`[${PKG_NAME}] ${ReviewRequestPlugin.licenceStatus.message} — running in the FREE tier — the 14-day evaluation (no card needed) runs from the plugin's admin page`);
         }
         if (!ReviewRequestPlugin.heartbeat) {
             ReviewRequestPlugin.heartbeat = new Heartbeat({
