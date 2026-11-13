@@ -1,4 +1,5 @@
 import * as https from 'https';
+import { cleanDomain } from './review-page';
 
 /**
  * Free Trustpilot integration.
@@ -13,7 +14,7 @@ import * as https from 'https';
  */
 
 export function buildReviewUrl(template: string, domain: string): string {
-    const d = (domain || '').trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    const d = cleanDomain(domain || '');
     return (template || 'https://www.trustpilot.com/evaluate/{domain}').replace(/\{domain\}/g, encodeURIComponent(d));
 }
 
