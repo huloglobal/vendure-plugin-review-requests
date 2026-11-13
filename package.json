@@ -1,6 +1,6 @@
 {
     "name": "@huloglobal/vendure-plugin-review-requests",
-    "version": "0.16.5",
+    "version": "0.16.6",
     "description": "Automated post-purchase review invitations for Vendure, timed off order dates: a branded email linking to your free Trustpilot page, Google reviews or any review site, with exclusions, a cooldown, one-click unsubscribe and click tracking.",
     "license": "AGPL-3.0-only",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",
@@ -29,7 +29,7 @@
         "test:watch": "vitest"
     },
     "dependencies": {
-        "@huloglobal/vendure-licence-sdk": "^0.15.4"
+        "@huloglobal/vendure-licence-sdk": "^0.15.6"
     },
     "peerDependencies": {
         "@vendure/core": ">=3.5.0 <4.0.0",
@@ -39,11 +39,11 @@
         "typeorm": ">=0.3.0"
     },
     "devDependencies": {
-        "@nestjs/common": "^10.0.0",
-        "@nestjs/schedule": "^4.0.0",
+        "@nestjs/common": "^12.0.1",
+        "@nestjs/schedule": "^12.0.3",
         "@types/node": "^20.0.0",
         "@types/nodemailer": "^6.4.0",
-        "@vendure/core": "^3.7.3",
+        "@vendure/core": "3.8.2",
         "nodemailer": "^6.9.0",
         "typescript": "^5.3.0",
         "vitest": "^2.0.0"

@@ -9,7 +9,7 @@ import { renderTemplate, wrapEmail } from './templates';
 import { buildReviewUrl, formatScore, renderStars } from './trustpilot';
 import {
     performSelfUpdate, selfUpdateEnv, evalInstanceId, describeLicence, RateLimiter,
-    licenceLifecycleNotice, formatStat,
+    licenceLifecycleNotice, formatStat, isAdminApiSession,
 } from '@huloglobal/vendure-licence-sdk';
 
 const BUY_URL = `https://elite.charity/licence/buy/${PLUGIN_SHORT_ID}`;
@@ -17,7 +17,7 @@ const DEFAULT_CHANNEL_CODE = '__default_channel__';
 
 function denyUnlessAdmin(ctx: RequestContext, res: Response, write: boolean | 'superadmin'): boolean {
     const needed = write === 'superadmin' ? [Permission.SuperAdmin] : write ? [Permission.UpdateSettings] : [Permission.ReadSettings];
-    if (!ctx.userHasPermissions(needed)) { res.status(403).json({ error: 'forbidden' }); return true; }
+    if (!isAdminApiSession(ctx) || !ctx.userHasPermissions(needed)) { res.status(403).json({ error: 'forbidden' }); return true; }
     return false;
 }
 
