@@ -4,6 +4,74 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-11-13
+
+Parity with the WordPress edition (HULO Review Requests 0.1.x + Pro), and the new tier split.
+
+### Fixed
+- **No invitation goes out while the review page is not set.** An empty Trustpilot domain (or a link that
+  needs an identifier and has none) used to send a review button that led nowhere, and the per-customer
+  cooldown then held those customers back from a proper invitation later. Now the hourly run, Send due now,
+  the order-page send, lists, bulk sends and test sends all refuse with "Set your review page on the
+  Settings tab first. Nothing was sent." Nothing is logged or claimed, so those customers are invited
+  normally once the page is set. The admin shows the same warning on every tab and on the order panel.
+- **Review-page identifiers are validated.** Saving the settings takes the identifier from whatever was
+  typed or pasted: a Trustpilot page (`trustpilot.com/review/<domain>`) or the shop's own address gives the
+  domain, a Google `writereview?placeid=…` link gives the Place ID, a Reviews.io page gives the store ID.
+  An identifier the platform cannot use (Trustpilot's own address, a `g.page` link as a Place ID, a store ID
+  with spaces) is not kept and the save says why; a custom link must be an `http(s)` link. The Connect
+  button applies the same rules.
+- **Reviews.io links work.** The Reviews.io platform built `reviews.io/company-review/store/{id}/new`, which
+  is not a review page; it is now `https://www.reviews.io/company-reviews/store/{id}`, and a template saved
+  by an earlier version is read as the new one.
+
+### Changed — tiers
+- **Free:** sending the invitation for one order from the order page (it used to need a licence). Opt-outs,
+  exclusions, the per-customer cooldown and the hourly limit apply, exactly as for scheduled sends.
+  Exclusions, the unsubscribe list, the e-mail editor with preview and test send, click tracking, the order
+  note and the dashboard widget are free too.
+- **Premium (licence or the 14-day evaluation):** scheduled sending and Send due now; lists, "Not invited
+  yet" with Invite selected, the orders-list bulk action and scheduled lists (new, below); **Resend**
+  (overriding a previous invitation, exclusions or the cooldown — never an opt-out); the Trustpilot/Google
+  **star-rating box** (without a licence the rating is not fetched at all); the **weekly e-mail report** and
+  the **set-up checklist**. When a licence lapses these stop (the weekly report is not sent, the checklist
+  is not shown, lists and the outbox wait) and everything is kept; they resume with a licence.
+- `PREMIUM_FEATURES` lists exactly the premium features above (it listed send-now for any order and
+  exclusions, which are free).
+
+### Added
+- **Invite customers from a list** (Customers tab, premium): paste one customer per line ("Name, e-mail",
+  "Name <e-mail>", the e-mail alone, addresses copied from an e-mail's To: field, Outlook's
+  "Last, First <e-mail>") or choose a CSV file of up to 1 MB with a name and an e-mail column (the header
+  row decides which column holds the address and which the first name). Send now — the first 20 straight
+  away, the rest in the background, 20 a minute within the hourly limit — or **schedule** the list: each
+  customer is invited the channel's delay in days from now by the hourly run, while the channel's sending
+  is on. Entries that could not be read are counted and the first is quoted. List customers get the
+  built-in e-mail without the order sentence and, when no name is known, "How did we do? …" as the
+  subject. `POST /review-requests/lists?channelId=…&mode=now|schedule` (text/plain or text/csv body).
+- **Not invited yet** (Customers tab, premium): recent orders at or beyond each channel's trigger state
+  without an invitation (including orders not due yet; unsubscribed customers left out, excluded customers
+  and those in their cooldown flagged), the scheduled list rows (removable) and the background outbox,
+  with **Invite selected**. `GET /review-requests/not-invited`, `POST /review-requests/invite-selected`,
+  `DELETE /review-requests/queue/:id`.
+- **"Send review invitation" bulk action on the Orders list** (premium): the first 20 now, the rest in the
+  background within the hourly limit. `POST /review-requests/bulk-send`.
+- **Unsubscribed list** on the Exclusions tab (free), with search and "Check an address".
+  `GET /review-requests/optouts`.
+- **Order note on send:** every invitation sent for an order adds the staff-only note "Review invitation
+  e-mailed to …" to the order's history (best effort; a failure never fails the send).
+- **The order-page send honours the cooldown** (and the hourly limit): a customer invited within the
+  cooldown is refused with the reason, and the order panel says so; Resend overrides it (premium).
+- The hourly limit (`maxPerRun`, now labelled "Most invitations per hour") counts scheduled and staff
+  sends together, per channel.
+- New table `review_queue` (list rows and the background outbox) and column `review_log.queueId`, both
+  created on boot (MariaDB/MySQL and PostgreSQL); existing data is untouched. A worker job runs the outbox
+  every minute.
+
+### Notes
+- The SQL corpus test now fails when it reads fewer statements than expected (a regular expression inside
+  a `${}` expression used to stop the extractor silently).
+
 ## [0.16.6] — 2026-11-13
 
 ### Security
