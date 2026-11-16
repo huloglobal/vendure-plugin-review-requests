@@ -4,6 +4,36 @@ All notable changes to `@huloglobal/vendure-plugin-review-requests` are document
 here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-11-16
+
+### Changed
+- **The invitation e-mail has a new design:** a 600px white card on a light grey background, your logo (or the
+  business name in bold) above a bar in your accent colour, then the e-mail you edit, and a footer strip with the
+  unsubscribe link and your own footer text. Buttons use the accent colour ("Leave a review" filled, each product's
+  "Review this" outlined); the star rating sits in a light info box. Inline styles and tables only, so it survives
+  senders that strip style blocks. New optional plugin options: `email.accentColor` (default `#155dfc`),
+  `email.logoUrl`, `email.logoWidth` and `email.footerText`.
+- **Every invitation now carries a plain-text part** as well as the HTML.
+- **New built-in text** with a heading, and a new `{{signOff}}` variable: "Kind regards," and the business name,
+  plus the channel's reply-to address when one is set. Templates you saved keep their own wording and render
+  unchanged inside the new card; Reset to default picks up the new text.
+- **The unsubscribe pages** (confirm, done, expired) use the same card and accent colour, and say that order
+  and account e-mails are not affected.
+- The editor preview is built by the same code as a real send, so it matches what customers receive.
+- Dependencies: development dependencies refreshed to their latest minor/patch versions (`@nestjs/common`
+  12.5, `@nestjs/schedule` 12.0.4, `nodemailer` 6.10, `typescript` 5.9, `vitest` 2.1.9 and types).
+
+### Fixed
+- **Product review links for stores without English product names.** Product names and slugs were read in
+  English only, so a store whose catalogue has no `en` translation sent no product list. Each product now uses
+  the order channel's default language, then English, then any translation it has.
+- **The unsubscribe button works behind a path prefix.** The confirm page posted to `/review-requests/optout`
+  from the site root; it now posts back to its own address.
+- An expired or forged unsubscribe link answers `400` on POST too (it answered `200`).
+- A test send to something that is not an e-mail address is refused with a clear message.
+- Link and colour values reaching the e-mail are escaped and validated (only `http(s)` links and `#rrggbb`
+  colours).
+
 ## [0.17.0] — 2026-11-13
 
 Parity with the WordPress edition (HULO Review Requests 0.1.x + Pro), and the new tier split.

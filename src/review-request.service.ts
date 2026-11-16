@@ -8,7 +8,10 @@ import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import * as nodemailer from 'nodemailer';
 
 import { DEFAULT_CONFIG, ReviewChannelConfig, ReviewPluginOptions, TriggerState } from './types';
-import { DEFAULT_LIST_BODY, DEFAULT_SUBJECT_NO_NAME, DEFAULT_TEMPLATE, Template, renderTemplate, wrapEmail, escapeHtml } from './templates';
+import {
+    DEFAULT_LIST_BODY, DEFAULT_SUBJECT_NO_NAME, DEFAULT_TEMPLATE, Template, renderTemplate, wrapEmail, escapeHtml,
+    resolveDesign, reviewButtonHtml, productListHtml, ratingBlockHtml, signOffHtml, htmlToText,
+} from './templates';
 import { buildReviewUrl, fetchRating, findBusinessUnitId, formatScore, renderStars, TrustpilotRating } from './trustpilot';
 import { fetchGoogleRating } from './google';
 import { parseClickToken, signClickToken } from './click-token';
@@ -19,6 +22,19 @@ const loggerCtx = 'ReviewRequests';
 
 /** Days beyond `delayDays` an order stays a candidate (slow carriers, worker downtime). */
 const LOOKBACK_DAYS = 45;
+
+/** One name + slug per product, in first-seen order (max 20): `lang` first, then English, then any. */
+export function pickProductTranslations(rows: Array<{ productId: any; languageCode: string; name: string; slug: string }>, lang: string): Array<{ name: string; slug: string }> {
+    const rank = (l: string) => (lang && l === lang ? 0 : l === 'en' ? 1 : 2);
+    const best = new Map<string, { r: number; name: string; slug: string }>();
+    for (const row of rows) {
+        const id = String(row.productId);
+        const r = rank(String(row.languageCode || ''));
+        const cur = best.get(id);
+        if (!cur || r < cur.r) best.set(id, { r, name: String(row.name || ''), slug: String(row.slug || '') });
+    }
+    return [...best.values()].filter(p => p.name).slice(0, 20).map(({ name, slug }) => ({ name, slug }));
+}
 
 /** Package short id — pref namespace, buy URL, digest id. */
 export const PLUGIN_SHORT_ID = 'vendure-plugin-review-requests';
@@ -860,19 +876,32 @@ export class ReviewRequestService implements OnModuleInit {
         return null;
     }
 
-    /** Products on an order (name + slug), for product-review links. */
+    /**
+     * Products on an order (name + slug), for product-review links. One translation per product:
+     * the order channel's default language, else English, else any (0.18.0: it used to read English
+     * only, so a store without English translations had no product links).
+     */
     async getOrderProducts(orderId: number): Promise<Array<{ name: string; slug: string }>> {
         if (!orderId) return [];
-        return this.db.query(
-            `SELECT DISTINCT pt.name, pt.slug
+        const rows: any[] = await this.db.query(
+            `SELECT p.id AS productId, pt.\`languageCode\` AS languageCode, pt.name, pt.slug
              FROM order_line ol
              JOIN product_variant pv ON pv.id = ol.\`productVariantId\`
              JOIN product p ON p.id = pv.\`productId\`
-             JOIN product_translation pt ON pt.\`baseId\` = p.id AND pt.\`languageCode\` = 'en'
+             JOIN product_translation pt ON pt.\`baseId\` = p.id
              WHERE ol.\`orderId\` = ?
-             LIMIT 20`,
+             ORDER BY ol.id
+             LIMIT 400`,
             [orderId],
         ).catch(() => []);
+        if (!rows.length) return [];
+        const [ch] = await this.db.query(
+            `SELECT c.\`defaultLanguageCode\` AS lang FROM channel c
+             JOIN order_channels_channel occ ON occ.\`channelId\` = c.id
+             WHERE occ.\`orderId\` = ? ORDER BY c.id DESC LIMIT 1`,
+            [orderId],
+        ).catch(() => []);
+        return pickProductTranslations(rows, String(ch?.lang || ''));
     }
 
     private productReviewUrl(template: string, slug: string, name: string, orderCode: string): string {
@@ -882,19 +911,10 @@ export class ReviewRequestService implements OnModuleInit {
             .replace(/\{orderCode\}/g, encodeURIComponent(orderCode || ''));
     }
 
-    private renderProductList(products: Array<{ name: string; slug: string }>, template: string, orderCode: string): string {
+    renderProductList(products: Array<{ name: string; slug: string }>, template: string, orderCode: string): string {
         if (!products.length || !template) return '';
-        const rows = products.map(p => {
-            const url = this.productReviewUrl(template, p.slug, p.name, orderCode);
-            return `<tr>
-                <td style="padding:8px 0;font-size:14px;color:#0f172a">${escapeHtml(p.name)}</td>
-                <td style="padding:8px 0;text-align:right"><a href="${url}" style="display:inline-block;background:#0f172a;color:#fff;text-decoration:none;font-weight:600;font-size:13px;padding:8px 16px;border-radius:6px">Review this</a></td>
-            </tr>`;
-        }).join('');
-        return `<div style="margin:0 0 22px">
-            <p style="text-align:center;font-weight:600;font-size:14px;margin:0 0 6px;color:#0f172a">Tell others about what you bought</p>
-            <table style="width:100%;border-collapse:collapse">${rows}</table>
-        </div>`;
+        const accent = resolveDesign(this.options.email).accentColor;
+        return productListHtml(products.map(p => ({ name: p.name, url: this.productReviewUrl(template, p.slug, p.name, orderCode) })), accent);
     }
 
     // ── Review-link click tracking ──────────────────────────────────────
@@ -918,13 +938,19 @@ export class ReviewRequestService implements OnModuleInit {
         return url;
     }
 
-    async composeEmail(cfg: ReviewChannelConfig, to: string, firstName: string, orderCode: string, orderId = 0, logId = 0): Promise<{ subject: string; html: string; unsubscribeUrl: string } | null> {
-        const tpl = await this.getTemplate(cfg.channelId);
+    /**
+     * The invitation for one customer. `opts.override` renders an unsaved subject/body (the editor's
+     * preview); `opts.preview` uses '#' for the unsubscribe link instead of signing a real one.
+     */
+    async composeEmail(cfg: ReviewChannelConfig, to: string, firstName: string, orderCode: string, orderId = 0, logId = 0,
+        opts: { override?: Template; preview?: boolean } = {}): Promise<{ subject: string; html: string; text: string; unsubscribeUrl: string } | null> {
+        const tpl = opts.override ? { ...opts.override, isDefault: false } : await this.getTemplate(cfg.channelId);
         // Real sends (a log row exists) link through the signed click redirect; previews and tests link straight to the review page.
         const reviewUrl = (await this.clickUrl(logId)) || buildReviewUrl(cfg.reviewUrlTemplate, cfg.trustpilotDomain);
         // The star-rating box is premium (0.17.0): without a licence or evaluation the rating is not even fetched.
         const rating = this.hasPremium() ? await this.getRating(cfg) : null;
         const businessName = cfg.businessName || cfg.trustpilotDomain || 'us';
+        const design = resolveDesign(this.options.email);
         const wantService = cfg.reviewMode === 'service' || cfg.reviewMode === 'both';
         const wantProduct = cfg.reviewMode === 'product' || cfg.reviewMode === 'both';
         // A customer from a list has no order: no products, and the built-in e-mail drops the order sentence.
@@ -939,26 +965,24 @@ export class ReviewRequestService implements OnModuleInit {
         // With no products to show (a list customer, or no product link) the store review button is always included.
         const showService = wantService || !productList;
         const ratingBlock = (showService && rating && Number.isFinite(rating.trustScore))
-            ? `<div style="text-align:center;margin:0 0 18px">${renderStars(rating.stars)}` +
-              `<div style="font-size:13px;color:#475569;margin-top:6px">Rated <strong>${formatScore(rating)}</strong> by ${rating.numberOfReviews.toLocaleString()} customers on ${this.platformName(cfg)}</div></div>`
+            ? ratingBlockHtml(renderStars(rating.stars), formatScore(rating), rating.numberOfReviews, this.platformName(cfg))
             : '';
-        const reviewButton = showService
-            ? `<p style="margin:0 0 22px;text-align:center"><a href="${reviewUrl}" style="display:inline-block;background:#00b67a;color:#fff;text-decoration:none;font-weight:700;font-size:16px;padding:14px 28px;border-radius:8px">★ Leave a review</a></p>`
-            : '';
+        const reviewButton = showService && /^https?:\/\//i.test(reviewUrl) ? reviewButtonHtml(reviewUrl, design.accentColor) : '';
 
-        const unsubscribeUrl = await this.optOutUrl(to);
+        const unsubscribeUrl = opts.preview ? '#' : await this.optOutUrl(to);
         const known = (firstName || '').trim();
         const vars = {
             firstName: escapeHtml(known || 'there'), orderCode: escapeHtml(orderCode), businessName: escapeHtml(businessName),
-            reviewUrl, ratingBlock, reviewButton, productList,
-            unsubscribeUrl,
+            reviewUrl: escapeHtml(reviewUrl), ratingBlock, reviewButton, productList,
+            signOff: signOffHtml(businessName, cfg.replyTo, design.accentColor),
+            unsubscribeUrl: escapeHtml(unsubscribeUrl),
         };
         const body = fromList && tpl.isDefault ? DEFAULT_LIST_BODY : tpl.body;
         const subjectTpl = !known && tpl.isDefault ? DEFAULT_SUBJECT_NO_NAME : tpl.subject;
-        const subject = renderTemplate(subjectTpl, { ...vars, firstName: known || 'there', orderCode, businessName });
+        const subject = renderTemplate(subjectTpl, { firstName: known || 'there', orderCode, businessName }).replace(/[\r\n]+/g, ' ');
         const bodyHtml = renderTemplate(body, vars);
-        const html = wrapEmail(bodyHtml, businessName, unsubscribeUrl);
-        return { subject, html, unsubscribeUrl };
+        const html = wrapEmail(bodyHtml, businessName, unsubscribeUrl, this.options.email);
+        return { subject, html, text: htmlToText(html), unsubscribeUrl };
     }
 
     async sendInvitation(cfg: ReviewChannelConfig, order: { id: number; code: string; email: string; firstName: string }, logId = 0): Promise<{ ok: boolean; reason?: string }> {
@@ -976,6 +1000,7 @@ export class ReviewRequestService implements OnModuleInit {
                 replyTo: cfg.replyTo || undefined,
                 subject: composed.subject,
                 html: composed.html,
+                text: composed.text,
                 headers: {
                     'List-Unsubscribe': `<${composed.unsubscribeUrl}>`,
                     'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',

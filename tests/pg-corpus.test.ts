@@ -59,7 +59,7 @@ const STAND_IN_DDL = [
     // licence-sdk's shared store (the unsubscribe-link secret is read/created in it directly).
     `CREATE TABLE hulo_licence_store (pluginId VARCHAR(128) PRIMARY KEY, licenceKey TEXT NOT NULL, updatedAt TIMESTAMP NOT NULL DEFAULT NOW())`,
     `CREATE TABLE customer_channels_channel ("customerId" INT, "channelId" INT, PRIMARY KEY ("customerId", "channelId"))`,
-    `CREATE TABLE channel (id SERIAL PRIMARY KEY, code VARCHAR, token VARCHAR)`,
+    `CREATE TABLE channel (id SERIAL PRIMARY KEY, code VARCHAR, token VARCHAR, "defaultLanguageCode" VARCHAR)`,
     `CREATE TABLE order_line (id SERIAL PRIMARY KEY, "orderId" INT, "productVariantId" INT)`,
     `CREATE TABLE product_variant (id SERIAL PRIMARY KEY, "productId" INT, "deletedAt" TIMESTAMP)`,
     `CREATE TABLE product (id SERIAL PRIMARY KEY, "deletedAt" TIMESTAMP)`,

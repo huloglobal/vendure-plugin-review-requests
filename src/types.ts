@@ -1,6 +1,7 @@
 /**
  * Shared types for @huloglobal/vendure-plugin-review-requests.
  */
+import type { EmailDesign } from './templates';
 
 /** Which order milestone starts the delay clock. */
 export type TriggerState = 'Delivered' | 'PaymentSettled' | 'Shipped';
@@ -66,6 +67,10 @@ export interface ReviewPluginOptions {
     smtp?: { host: string; port: number; user: string; pass: string; from: string };
     /** Secret used to sign opt-out links. Falls back to HULO_IP_SALT. */
     optOutSecret?: string;
+    /** The invitation e-mail's look (all optional): `accentColor` (#rrggbb, default #155dfc) for the
+     *  bar under the header and the buttons, `logoUrl` (https) shown instead of the store name,
+     *  `logoWidth` in pixels (default 140) and `footerText`, your own footer or legal line. */
+    email?: EmailDesign;
     /** Disable the scheduled sender (e.g. for a read-only replica). */
     disableCron?: boolean;
     /** How the cron runs are logged / capped is per-channel (maxPerRun). */

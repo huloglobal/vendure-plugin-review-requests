@@ -64,9 +64,29 @@ plugins: [
     ReviewRequestPlugin.init({
         publicBaseUrl: 'https://shop.example.com',   // for unsubscribe links
         licenceKey: process.env.HULO_REVIEW_LICENCE,
+        // Optional: the invitation e-mail's look (since 0.18.0)
+        email: {
+            accentColor: '#155dfc',                        // bar under the header and the buttons
+            logoUrl: 'https://shop.example.com/logo.png',  // https; without it the store name is shown
+            logoWidth: 140,                                // pixels
+            footerText: 'Example Shop Ltd, registered in England and Wales no. 01234567',
+        },
     }),
 ],
 ```
+
+### The invitation e-mail
+
+The e-mail is a 600px card: your logo (or the business name in bold), a bar
+in your accent colour, the subject and body you edit on the E-mail tab, then a
+footer strip with the unsubscribe link and your `footerText`. Every e-mail
+also carries a plain-text version. The built-in body ends with `{{signOff}}`:
+"Kind regards," and the business name, plus the channel's reply-to address
+when one is set. A template you saved earlier renders as it is, inside the
+card; to pick up the new built-in text, use **Reset to default** on the E-mail
+tab. Variables: `{{firstName}}` `{{orderCode}}` `{{businessName}}`
+`{{reviewUrl}}` `{{ratingBlock}}` `{{reviewButton}}` `{{productList}}`
+`{{signOff}}` `{{unsubscribeUrl}}`.
 
 Admin UI:
 
@@ -81,6 +101,10 @@ checklist at the top (SMTP, email, review page, timing, first send), hit
 **Send test**, and switch the channel on.
 
 
+> **Since 0.18.0:** the invitation e-mail and the unsubscribe pages use the
+> new card design (optional `email` options above) and invitations carry a
+> plain-text part; nothing to migrate.
+>
 > **Since 0.15.2:** invitations need `publicBaseUrl` (the unsubscribe link);
 > set `optOutSecret` to keep unsubscribe links valid across reinstalls
 > (otherwise a per-install secret is generated and stored); the trigger

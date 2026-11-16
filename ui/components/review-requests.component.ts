@@ -770,6 +770,7 @@ export class ReviewRequestsComponent implements OnInit {
         { token: '{{productList}}', label: 'Product list' },
         { token: '{{ratingBlock}}', label: 'Star rating' },
         { token: '{{reviewUrl}}', label: 'Review link' },
+        { token: '{{signOff}}', label: 'Sign-off' },
     ];
     running = false; checking = false; checkMsg = '';
     advancedOpen = false; connecting = false; connectMsg = ''; connectOk = false;

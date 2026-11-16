@@ -7,8 +7,11 @@ import { reviewPageProblem, validateReviewPage } from './review-page';
 import { MAX_LIST_BYTES } from './list-parser';
 import { ReviewRequestPlugin } from './plugin';
 import { ReviewChannelConfig } from './types';
-import { renderTemplate, wrapEmail } from './templates';
-import { buildReviewUrl, formatScore, renderStars } from './trustpilot';
+import { escapeHtml, publicPageHtml, resolveDesign } from './templates';
+import { buildReviewUrl } from './trustpilot';
+import { isEmail } from './list-parser';
+
+const EXPIRED_TEXT = 'This unsubscribe link is invalid or has expired. If you keep getting e-mails, just reply to one and we\'ll remove you.';
 import {
     performSelfUpdate, selfUpdateEnv, evalInstanceId, describeLicence, RateLimiter,
     licenceLifecycleNotice, formatStat, isAdminApiSession,
@@ -93,9 +96,13 @@ export class ReviewRequestController {
         if (this.limited(req, res)) return;
         const valid = await this.service.optOutTokenValid(String(e || ''), String(t || ''));
         res.setHeader('cache-control', 'no-store');
-        if (!valid) return res.status(400).type('html').send(this.optoutHtml(false, 'Link expired', 'This unsubscribe link is invalid or has expired. If you keep getting emails, just reply to one and we\'ll remove you.'));
-        const action = `/review-requests/optout?e=${encodeURIComponent(String(e || ''))}&t=${encodeURIComponent(String(t || ''))}`;
-        return res.type('html').send(this.optoutHtml(true, 'Unsubscribe from review requests?', `<form method="post" action="${action}"><button type="submit" style="background:#0f172a;color:#fff;border:0;border-radius:8px;padding:12px 22px;font-size:15px;cursor:pointer">Yes, unsubscribe me</button></form>`));
+        if (!valid) return res.status(400).type('html').send(this.optoutHtml('Link expired', `<p style="margin:0">${EXPIRED_TEXT}</p>`));
+        // Relative action: the form posts back to this same route even when the server sits behind a path prefix.
+        const action = `optout?e=${encodeURIComponent(String(e || ''))}&t=${encodeURIComponent(String(t || ''))}`;
+        const accent = resolveDesign(this.service.getOptions().email).accentColor;
+        return res.type('html').send(this.optoutHtml('Unsubscribe from review requests?',
+            `<p style="margin:0 0 18px">You will stop receiving review invitations from us. Order and account e-mails are not affected.</p>`
+            + `<form method="post" action="${escapeHtml(action)}" style="margin:0"><button type="submit" style="background-color:${accent};color:#ffffff;border:0;border-radius:8px;padding:12px 22px;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:bold;cursor:pointer">Yes, unsubscribe me</button></form>`));
     }
 
     /** RFC 8058 one-click (mail clients POST here) and the confirm button above. */
@@ -104,19 +111,13 @@ export class ReviewRequestController {
         if (this.limited(req, res)) return;
         const ok = await this.service.optOut(String(e || ''), String(t || ''));
         res.setHeader('cache-control', 'no-store');
-        res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<div style="font-family:Arial,sans-serif;max-width:520px;margin:60px auto;padding:24px;text-align:center;color:#0f172a">
-<h1 style="font-size:22px">${ok ? 'You\'re unsubscribed' : 'Link expired'}</h1>
-<p style="color:#475569;line-height:1.6">${ok
-    ? 'You won\'t receive any more review requests from us. Thanks — and sorry for the interruption.'
-    : 'This unsubscribe link is invalid or has expired. If you keep getting emails, just reply to one and we\'ll remove you.'}</p>
-</div>`);
+        res.status(ok ? 200 : 400).type('html').send(ok
+            ? this.optoutHtml('You\'re unsubscribed', '<p style="margin:0">You won\'t receive any more review requests from us. Thank you, and sorry for the interruption.</p>')
+            : this.optoutHtml('Link expired', `<p style="margin:0">${EXPIRED_TEXT}</p>`));
     }
 
-    private optoutHtml(ok: boolean, title: string, body: string): string {
-        return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
-<div style="font-family:Arial,sans-serif;max-width:520px;margin:60px auto;padding:24px;text-align:center;color:#0f172a">
-<h1 style="font-size:22px">${title}</h1><div style="color:#475569;line-height:1.6">${body}</div></div>`;
+    private optoutHtml(title: string, body: string): string {
+        return publicPageHtml(title, body, this.service.getOptions().email);
     }
 
     private static limiter = new RateLimiter({ capacity: 30, windowMs: 60_000 });
@@ -135,7 +136,7 @@ export class ReviewRequestController {
         if (this.limited(req, res, 'click')) return;
         res.setHeader('cache-control', 'no-store');
         const url = await this.service.recordClick(String(token || '')).catch(() => null);
-        if (!url) return res.status(404).type('html').send(this.optoutHtml(false, 'Link expired', 'This review link is no longer valid. You can still leave a review on the business\'s review page directly.'));
+        if (!url) return res.status(404).type('html').send(this.optoutHtml('Link expired', '<p style="margin:0">This review link is no longer valid. You can still leave a review on the business\'s review page directly.</p>'));
         return res.redirect(302, url);
     }
 
@@ -582,40 +583,24 @@ export class ReviewRequestController {
         const ch = scopedChannel(ctx, body?.channelId);
         if (!ch) return res.status(403).json({ error: 'forbidden' });
         const cfg = await this.service.getConfig(ch);
-        const rating = ReviewRequestPlugin.hasPremiumAccess() ? await this.service.getRating(cfg) : null;
-        const businessName = cfg.businessName || cfg.trustpilotDomain || 'Your Store';
-        const wantService = cfg.reviewMode === 'service' || cfg.reviewMode === 'both';
-        const wantProduct = cfg.reviewMode === 'product' || cfg.reviewMode === 'both';
-        const reviewUrl = buildReviewUrl(cfg.reviewUrlTemplate, cfg.trustpilotDomain);
-        const ratingBlock = (wantService && rating && Number.isFinite(rating.trustScore))
-            ? `<div style="text-align:center;margin:0 0 18px">${renderStars(rating.stars)}<div style="font-size:13px;color:#475569;margin-top:6px">Rated <strong>${formatScore(rating)}</strong> by ${rating.numberOfReviews.toLocaleString()} customers on ${this.service.platformName(cfg)}</div></div>`
-            : '';
-        const reviewButton = wantService
-            ? `<p style="margin:0 0 22px;text-align:center"><a href="${reviewUrl}" style="display:inline-block;background:#00b67a;color:#fff;text-decoration:none;font-weight:700;font-size:16px;padding:14px 28px;border-radius:8px">★ Leave a review</a></p>`
-            : '';
-        let productList = '';
-        if (wantProduct && cfg.productReviewUrlTemplate) {
-            const sample = [{ name: 'Sample Product A', slug: 'sample-a' }, { name: 'Sample Product B', slug: 'sample-b' }];
-            productList = (this.service as any).renderProductList(sample, cfg.productReviewUrlTemplate, 'DEMO12345678');
-        }
-        const vars = { firstName: 'Sam', orderCode: 'DEMO12345678', businessName, reviewUrl, ratingBlock, reviewButton, productList, unsubscribeUrl: '#' };
-        return res.json({
-            subject: renderTemplate(body.subject || '', vars),
-            html: wrapEmail(renderTemplate(body.body || '', vars), businessName, '#'),
-        });
+        // The same composition as a real send (sample customer and products), with the unsaved subject and body.
+        const c = await this.service.composeEmail(cfg, 'preview@example.com', 'Sam', 'DEMO12345678', 0, 0,
+            { override: { subject: String(body?.subject || ''), body: String(body?.body || '') }, preview: true });
+        return res.json({ subject: c?.subject || '', html: c?.html || '', text: c?.text || '' });
     }
 
     // ── Admin: send a test to yourself ─────────────────────────────────
     @Post('test-send')
     async testSend(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { channelId: number; email: string }) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        if (!body?.email) return res.status(400).json({ error: 'email required' });
+        const testTo = String(body?.email || '').trim().slice(0, 320);
+        if (!isEmail(testTo)) return res.status(400).json({ ok: false, error: 'email required', reason: 'Enter a valid e-mail address to send the test to.' });
         const ch = scopedChannel(ctx, body.channelId, true);
         if (!ch) return res.status(403).json({ error: 'forbidden' });
         const cfg = await this.service.getConfig(ch);
         const problem = reviewPageProblem(cfg);
         if (problem) return res.status(400).json({ ok: false, reason: problem, code: 'not_set_up' });
-        const result = await this.service.sendInvitation(cfg, { id: 0, code: 'TEST-1234', email: String(body.email).trim().slice(0, 320), firstName: 'there' });
+        const result = await this.service.sendInvitation(cfg, { id: 0, code: 'TEST-1234', email: testTo, firstName: 'there' });
         return res.status(result.ok ? 200 : 500).json(result);
     }
 

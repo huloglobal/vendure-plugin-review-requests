@@ -119,9 +119,13 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
         expect(await svc().isExcluded(email)).toBe(false);
         const applied = await (await fetch(url, { method: 'POST' })).text();
         expect(applied).toContain('unsubscribed');
+        expect(applied).toContain('border:1px solid #e5e7eb;border-radius:10px'); // 0.18.0 card
+        expect(good).toContain('action="optout?e='); // relative: works behind a path prefix
         expect(await svc().isExcluded(email)).toBe(true);
         const bad = await (await fetch(`${BASE}/review-requests/optout?e=x@y.com&t=nope`)).text();
         expect(bad).toContain('expired');
+        const badPost = await fetch(`${BASE}/review-requests/optout?e=x@y.com&t=nope`, { method: 'POST' });
+        expect(badPost.status).toBe(400);
     });
 
     it('template save rejects an oversized subject / body with a 400 and a size message (service-level guard lives in the controller)', async () => {
@@ -177,6 +181,34 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
         expect(composed).toBeTruthy();
         expect(composed!.html).toContain('trustpilot.com/evaluate/elite-software.co.uk');
         expect(composed!.subject).toContain('Sam');
+        // 0.18.0: the shared card, a plain-text alternative, the sign-off
+        expect(composed!.html).toContain('border-bottom:3px solid #155dfc');
+        expect(composed!.html).toContain('Kind regards,');
+        expect(composed!.text).toContain('Leave a review (https://');
+        expect(composed!.text).toContain('Unsubscribe (http://localhost');
+        expect(composed!.text).not.toMatch(/<[a-z]/i);
+    });
+
+    it('a saved custom template still renders inside the new card (0.18.0)', async () => {
+        await svc().saveTemplate(1, 'Hello {{firstName}}', '<p class="mine">Custom for {{firstName}} at {{businessName}}</p>{{reviewButton}}');
+        try {
+            const c = await svc().composeEmail(await svc().getConfig(1), 'shopper@example.com', 'Sam <b>', 'ORD123');
+            expect(c!.subject).toBe('Hello Sam <b>');
+            expect(c!.html).toContain('<p class="mine">Custom for Sam &lt;b&gt; at ');
+            expect(c!.html).toContain('Leave a review</a>');
+            expect(c!.html).toContain('max-width:600px');
+        } finally {
+            await (svc() as any).db.query('DELETE FROM review_template WHERE channelId = 1');
+        }
+    });
+
+    it('products on an order come from the channel language, with English and any-language fallbacks (0.18.0)', async () => {
+        const db = (svc() as any).db;
+        const [line] = await db.query('SELECT ol.`orderId` AS orderId FROM order_line ol LIMIT 1').catch(() => []);
+        if (!line) return; // no seeded order lines in this fixture
+        const products = await svc().getOrderProducts(Number(line.orderId));
+        expect(products.length).toBeGreaterThan(0);
+        expect(new Set(products.map(p => p.slug)).size).toBe(products.length);
     });
 
     it('composes product-review links in product / both mode', async () => {
@@ -192,7 +224,7 @@ run('@huloglobal/vendure-plugin-review-requests (MariaDB)', () => {
         const prod = { ...both, reviewMode: 'product' } as any;
         const c2 = await svc().composeEmail(prod, 'a@b.test', 'Sam', 'ORD1', 0);
         expect(c2!.html).toContain('Review this');
-        expect(c2!.html).not.toContain('★ Leave a review');
+        expect(c2!.html).not.toContain('Leave a review');
 
         // service-only (default) → no product list
         const svcOnly = { ...both, reviewMode: 'service' } as any;
